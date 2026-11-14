@@ -46,7 +46,7 @@ Batch-remove text from images — plus retouching, cropping and watermarking —
 
 <div align="center">
 <img src="docs/images/erase-detect.png" alt="Erase text: detection preview" width="290">
-<img src="docs/images/erase-result.png" alt="Text removed, with the fill-engine card" width="290">
+<img src="docs/images/erase-result.png" alt="Text removed; the fill-engine switch is in the left panel" width="290">
 <img src="docs/images/folded.png" alt="All toolbars fold away to maximise the picture" width="290">
 </div>
 
@@ -89,7 +89,7 @@ The toolbars fold away (click the black tab on the edge) so the picture gets the
 
 ### Fill engines
 
-The *Fill engine* card (in *Erase text* and *Batch*) decides how the gaps left by the text are filled:
+The *Fill engine* switch (in *Erase text* and *Batch*, next to the buttons that use it) decides how the gaps left by the text are filled:
 
 | Engine | Download | Speed¹ | Best for |
 |---|---|---|---|
@@ -100,7 +100,7 @@ The *Fill engine* card (in *Erase text* and *Batch*) decides how the gaps left b
 
 ¹ an 800 × 800 picture with two lines of text, 2 CPU cores, detection included.
 
-**Download** fetches the model from Hugging Face (or a mirror) after you confirm — the files are checked against a pinned
+The *Models* card right below manages the optional models. **Download** fetches a model from Hugging Face (or a mirror) after you confirm — the files are checked against a pinned
 SHA-256 — or **Import a model…** takes an ONNX file you already have. A model that is chosen but not installed is
 replaced by the best one that is, and the status bar says so. Models are stored in `%LOCALAPPDATA%\RubberStudio\models`.
 

@@ -1,4 +1,4 @@
-"""The left drawer: tool selector, the contextual tool panels, the fill-engine card and the history row."""
+"""The left drawer: tool selector, the contextual tool panels, the models card and the history row."""
 from __future__ import annotations
 
 import os
@@ -46,6 +46,17 @@ class PaperPane(QWidget):
             p.fillRect(0, 0, w, t, ink)
 
 
+class Rule(QWidget):
+    """A plain black line of a fixed thickness."""
+
+    def __init__(self, thickness: int = 2, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setFixedHeight(int(thickness))
+
+    def paintEvent(self, e) -> None:
+        QPainter(self).fillRect(self.rect(), QColor(T.INK))
+
+
 def _transparent_scroll(scroll: QScrollArea) -> None:
     scroll.setFrameShape(QScrollArea.Shape.NoFrame)
     scroll.setWidgetResizable(True)
@@ -82,7 +93,7 @@ class DetectOptions(QWidget):
         lay.addWidget(self.grow)
         lay.addSpacing(4)
         lay.addWidget(self.thorough)
-        lay.addWidget(HintLabel("er.thorough.hint", px=11))
+        self.retranslate()
         self.sens.valueChanged.connect(self._sens)
         self.grow.valueChanged.connect(self._grow)
         self.thorough.toggledBool.connect(self._thorough)
@@ -102,6 +113,9 @@ class DetectOptions(QWidget):
         self.editor.erase.thorough = on
         S.put("erase/thorough", on)
         self.editor.prefsChanged.emit()
+
+    def retranslate(self) -> None:
+        self.thorough.setToolTip(tr("er.thorough.hint"))
 
     def refresh(self) -> None:
         self.sens.setValue(self.editor.erase.sensitivity)
@@ -179,36 +193,62 @@ class ModelRow(QWidget):
         self.btn_rm.setEnabled(not busy_elsewhere)
 
 
-class EnginePanel(PopPanel):
-    """How the gaps left by the erased text are filled: one choice, plus the optional models to download or import."""
+class EngineChoice(QWidget):
+    """The fill-engine switch (Auto / Fast / MI-GAN / LaMa) with a short explanation. It sits inside the erase card and
+    the batch detection card, right above the buttons that use it."""
+
+    def __init__(self, editor: EditorModel, models: ModelController, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.editor, self.models = editor, models
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+        lay.addWidget(SectionLabel("eng.title"))
+        self.seg = PopSegmented([(e, f"eng.{e}") for e in ENGINES],
+                                editor.erase.engine if editor.erase.engine in ENGINES else "auto")
+        lay.addWidget(self.seg)
+        self.hint = HintLabel("", provider=self._hint_text, px=11)
+        lay.addWidget(self.hint)
+        self.seg.currentChanged.connect(self._engine)
+        models.changed.connect(self.refresh)
+        editor.prefsChanged.connect(self.refresh)
+
+    def _engine(self, ident: str) -> None:
+        self.editor.erase.engine = ident
+        S.put("erase/engine", ident)
+        self.editor.prefsChanged.emit()
+
+    def _hint_text(self) -> str:
+        eng = self.editor.erase.engine
+        if eng in MODELS and self.models.state(eng) == "missing":
+            return tr("eng.missing", name=MODELS[eng].label)
+        return tr(f"eng.hint.{eng if eng in ENGINES else 'auto'}")
+
+    def refresh(self) -> None:
+        eng = self.editor.erase.engine
+        if eng in ENGINES:
+            self.seg.setCurrent(eng)
+        self.hint.retranslate()
+
+
+class ModelsPanel(PopPanel):
+    """The optional fill models: download, import or remove each one."""
 
     _ready = False              # PopPanel.__init__ retranslates before our widgets exist
 
-    def __init__(self, editor: EditorModel, models: ModelController, parent: Optional[QWidget] = None):
-        super().__init__("eng.title", parent)
-        self.editor, self.models = editor, models
-        self.seg = PopSegmented([(e, f"eng.{e}") for e in ENGINES], editor.erase.engine if editor.erase.engine in ENGINES else "auto")
-        self.body.addWidget(self.seg)
-        self.hint = HintLabel("", provider=self._hint_text)
-        self.body.addWidget(self.hint)
+    def __init__(self, models: ModelController, parent: Optional[QWidget] = None):
+        super().__init__("eng.models", parent)
+        self.models = models
+        self.body.addWidget(HintLabel("eng.models.hint", px=11))
         self.rows = {m: ModelRow(m, models) for m in ("migan", "lama")}
         for row in self.rows.values():
             self.body.addWidget(row)
         self.btn_imp = PopButton("ai.import", "paper", "folder", height=34, px=10.5)
         self.body.addWidget(self.btn_imp)
-
-        self.seg.currentChanged.connect(self._engine)
         self.btn_imp.clicked.connect(self._import)
         models.changed.connect(self.refresh)
-        editor.prefsChanged.connect(self.refresh)
         self._ready = True
         self.refresh()
-
-    # --- actions ---------------------------------------------------------------------------------
-    def _engine(self, ident: str) -> None:
-        self.editor.erase.engine = ident
-        S.put("erase/engine", ident)
-        self.editor.prefsChanged.emit()
 
     def _import(self) -> None:
         start = S.get_str("ai/import_dir", "")
@@ -217,21 +257,9 @@ class EnginePanel(PopPanel):
             S.put("ai/import_dir", str(Path(path).parent))
             self.models.import_file(path)
 
-    # --- state -----------------------------------------------------------------------------------
-    def _hint_text(self) -> str:
-        eng = self.editor.erase.engine if hasattr(self, "editor") else "auto"
-        text = tr(f"eng.hint.{eng}")
-        if eng in MODELS and hasattr(self, "models") and self.models.state(eng) == "missing":
-            text += "  " + tr("eng.missing")
-        return text
-
     def refresh(self) -> None:
         if not self._ready:
             return
-        eng = self.editor.erase.engine
-        if eng in ENGINES:
-            self.seg.setCurrent(eng)
-        self.hint.retranslate()
         for row in self.rows.values():
             row.refresh()
         self.btn_imp.setEnabled(not self.models.busy)
@@ -361,7 +389,7 @@ class WatermarkPage(PopPanel):
 
 
 class ErasePage(QWidget):
-    """ERASE TEXT card + the fill-engine card below it."""
+    """ERASE TEXT card (with the fill-engine switch) + the models card below it."""
 
     def __init__(self, editor: EditorModel, models: ModelController, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -375,13 +403,15 @@ class ErasePage(QWidget):
         card.body.addWidget(self.scope)
         self.hint = HintLabel("er.hint.region")
         card.body.addWidget(self.hint)
-        self.opts = DetectOptions(editor)
-        card.body.addWidget(self.opts)
+        # the two actions stay at the top, so they are in reach however short the window is
         self.btn_detect = PopButton("er.detect", "paper", "eye", height=38, px=11)
         self.btn_run = PopButton("er.run", "red", "erase", height=38, px=11)
         card.body.addLayout(_row(self.btn_detect, self.btn_run))
+        self.opts = DetectOptions(editor)
+        card.body.addWidget(self.opts)
+        card.body.addWidget(EngineChoice(editor, models))
         lay.addWidget(card)
-        lay.addWidget(EnginePanel(editor, models))
+        lay.addWidget(ModelsPanel(models))
         self.scope.currentChanged.connect(self._scope)
         self.btn_detect.clicked.connect(editor.detect_text)
         self.btn_run.clicked.connect(editor.erase_text)
@@ -401,7 +431,7 @@ class ErasePage(QWidget):
 
 
 class BatchPage(QWidget):
-    """Batch run card, output card, detection card and the fill-engine card."""
+    """Batch run card, output card, detection card (with the fill-engine switch) and the models card."""
     addFilesRequested = Signal()
     addFolderRequested = Signal()
 
@@ -468,12 +498,13 @@ class BatchPage(QWidget):
         self.region_hint = HintLabel("bt.region.hint")
         det.body.addWidget(self.region_hint)
         det.body.addWidget(DetectOptions(editor))
+        det.body.addWidget(EngineChoice(editor, models))
         max_workers = max(1, min(4, (os.cpu_count() or 2) // 2))
         self.workers = PopSlider("bt.workers", 1, max(2, max_workers), min(s.workers, max_workers), step=1, decimals=0)
         self.workers.setVisible(max_workers > 1)
         det.body.addWidget(self.workers)
         lay.addWidget(det)
-        lay.addWidget(EnginePanel(editor, models))
+        lay.addWidget(ModelsPanel(models))
 
         # --- wiring ---------------------------------------------------------------------------
         browse.clicked.connect(self._browse)
@@ -587,8 +618,8 @@ class ToolDrawer(PaperPane):
         super().__init__("right", parent)
         self.editor = editor
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(14, 14, 18, 12)
-        lay.setSpacing(8)
+        lay.setContentsMargins(14, 12, 18, 10)
+        lay.setSpacing(6)
         lay.addWidget(SectionLabel("tool.set"))
         self.buttons: dict[Tool, ToolButton] = {}
         for tool, key, icon in ((Tool.CROP, "tool.crop", "crop"), (Tool.REPAIR, "tool.repair", "repair"),
@@ -619,6 +650,7 @@ class ToolDrawer(PaperPane):
         _transparent_scroll(self.scroll)
         self.scroll.setWidget(holder)
         lay.addWidget(self.scroll, 1)
+        lay.addWidget(Rule(2))          # a card that is cut off by the scroll area must not read as part of the buttons below
         self.history = HistoryRow(editor)
         lay.addWidget(self.history)
 

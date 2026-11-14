@@ -139,7 +139,7 @@ class ToolButton(PopButton):
     """Wide tool selector: a black square with the icon, then the name; the active tool is a red bar."""
 
     def __init__(self, key: str, icon: str, parent: Optional[QWidget] = None):
-        super().__init__(key, "paper", icon, parent, height=44, px=12)
+        super().__init__(key, "paper", icon, parent, height=36, px=12)
         self.setCheckable(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
@@ -156,8 +156,9 @@ class ToolButton(PopButton):
         draw_box(p, rect, fill=fill, border=2 if enabled else 1, border_color=edge)
         side = rect.height()
         p.fillRect(QRectF(rect.left(), rect.top(), side, side), QColor(chip))
-        draw_icon(p, self.icon_name or "", QRectF(rect.left(), rect.top(), side, side).adjusted(11, 11, -11, -11),
-                  QColor(T.PAPER), 1.9)
+        inset = side * 0.25
+        draw_icon(p, self.icon_name or "", QRectF(rect.left(), rect.top(), side, side).adjusted(inset, inset, -inset, -inset),
+                  QColor(T.PAPER), 1.8)
         p.setFont(T.font_label(self._px, True))
         p.setPen(QColor(text_col))
         p.drawText(QRectF(rect.left() + side + 12, rect.top(), rect.width() - side - 20, rect.height()),
@@ -481,8 +482,8 @@ class PopPanel(QFrame, Translatable):
         self._literal = text
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(0, int(T.RULE) + self.TITLE_H + 12, 0, 16)
-        self.body.setSpacing(10)
+        self.body.setContentsMargins(0, int(T.RULE) + self.TITLE_H + 12, 0, 14)
+        self.body.setSpacing(8)
         self.retranslate()
 
     def retranslate(self) -> None:

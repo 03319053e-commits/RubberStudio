@@ -38,7 +38,7 @@
 
 <div align="center">
 <img src="docs/images/erase-detect.png" alt="去除文字：检测预览" width="290">
-<img src="docs/images/erase-result.png" alt="文字已去除，旁边是填补引擎卡片" width="290">
+<img src="docs/images/erase-result.png" alt="文字已去除；填补引擎的切换在左侧面板里" width="290">
 <img src="docs/images/folded.png" alt="所有工具栏可折叠，让画面占满窗口" width="290">
 </div>
 
@@ -78,7 +78,7 @@
 
 ### 填补引擎
 
-“填补引擎”卡片（在“去除文字”和“批量去文字”里）决定如何补上文字留下的空白：
+“填补引擎”开关（在“去除文字”和“批量去文字”里，紧挨着要用到它的按钮）决定如何补上文字留下的空白：
 
 | 引擎 | 需要下载 | 速度¹ | 适合 |
 |---|---|---|---|
@@ -89,7 +89,7 @@
 
 ¹ 800 × 800 的图片、两行文字、2 核 CPU，含检测时间。
 
-点“**下载**”，确认后会从 Hugging Face（或镜像）获取模型，并用固定的 SHA-256 校验；或者点“**导入模型…**”选择你已有的 ONNX 文件。
+下方的“模型”卡片管理这些可选模型：点“**下载**”，确认后会从 Hugging Face（或镜像）获取模型，并用固定的 SHA-256 校验；或者点“**导入模型…**”选择你已有的 ONNX 文件。
 选了但没安装的模型，会改用已安装的最佳模型，并在状态栏提示。模型保存在 `%LOCALAPPDATA%\RubberStudio\models`。
 
 ## 从源码运行
