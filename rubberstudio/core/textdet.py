@@ -1,7 +1,9 @@
-"""Scene-text detector: PP-OCRv4 DBNet (ONNX) with a small, dependency-light post-processor.
+"""Scene-text detector: PP-OCRv4 + PP-OCRv5 DBNet (ONNX) with a small, dependency-light post-processor.
 
-Works for Latin, CJK and mixed text. Large / very tall images ("long screenshots") are
-detected tile by tile at native resolution so small text is not lost to down-scaling.
+Works for Latin, CJK and mixed text. Two detectors that were trained differently are run at several scales and their
+boxes are merged, because each one misses things the other finds (very large or widely letter-spaced display text,
+tiny captions, stylised fonts). Large / very tall images ("long screenshots") are detected tile by tile at native
+resolution so small text is not lost to down-scaling.
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from .ortutil import open_session
 from .paths import resource_path
 
 MODEL_NAME = "ch_PP-OCRv4_det_infer.onnx"
+MODEL_NAMES = (MODEL_NAME, "ch_PP-OCRv5_mobile_det.onnx")
 
 
 @dataclass
@@ -49,24 +52,38 @@ def default_model_path() -> Path:
     return resource_path("rubberstudio", "core", "models", MODEL_NAME)
 
 
+def default_model_paths() -> list[Path]:
+    """Every bundled detector that is present (the PP-OCRv4 model is mandatory, the others are a bonus)."""
+    return [p for p in (resource_path("rubberstudio", "core", "models", n) for n in MODEL_NAMES) if p.is_file()]
+
+
 def _round32(v: float) -> int:
     return max(32, int(round(v / 32.0)) * 32)
 
 
 class TextDetector:
-    """DBNet text detector. One instance is safe to share between threads."""
+    """DBNet text detector(s). One instance is safe to share between threads."""
 
-    def __init__(self, model_path: Optional[Path] = None, intra_threads: int = 0):
-        path = Path(model_path) if model_path else default_model_path()
-        if not path.is_file():
-            raise FileNotFoundError(f"text detection model not found: {path}")
-        so = ort.SessionOptions()
-        so.log_severity_level = 3
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if intra_threads > 0:
-            so.intra_op_num_threads = intra_threads
-        self._session = open_session(path, so)
-        self._input = self._session.get_inputs()[0].name
+    def __init__(self, model_path: Optional[Path] = None, intra_threads: int = 0,
+                 extra_models: Optional[Sequence[Path]] = None):
+        if model_path is not None:
+            paths = [Path(model_path)] + [Path(p) for p in (extra_models or [])]
+        else:
+            paths = default_model_paths() + [Path(p) for p in (extra_models or [])]
+            if not paths:
+                paths = [default_model_path()]
+        for path in paths:
+            if not path.is_file():
+                raise FileNotFoundError(f"text detection model not found: {path}")
+        self._sessions: list[tuple[ort.InferenceSession, str]] = []
+        for path in paths:
+            so = ort.SessionOptions()
+            so.log_severity_level = 3
+            so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            if intra_threads > 0:
+                so.intra_op_num_threads = intra_threads
+            sess = open_session(path, so)
+            self._sessions.append((sess, sess.get_inputs()[0].name))
         # tuning (PP-OCRv4 defaults, as used by RapidOCR)
         self.limit_min_side = 736
         self.max_side = 2048
@@ -75,12 +92,19 @@ class TextDetector:
         self.thresh = 0.3
         self.unclip_ratio = 1.6
 
+    @property
+    def model_count(self) -> int:
+        return len(self._sessions)
+
     # ------------------------------------------------------------------ public
 
     def detect(self, rgb: np.ndarray, *, box_thresh: float = 0.5,
                region: Optional[tuple[int, int, int, int]] = None,
-               cancel: Optional[Callable[[], bool]] = None) -> list[TextBox]:
-        """Find text in ``rgb`` (H×W×3/4 uint8). ``region`` = (x0, y0, x1, y1) pixel rectangle to search."""
+               cancel: Optional[Callable[[], bool]] = None, thorough: bool = True) -> list[TextBox]:
+        """Find text in ``rgb`` (H×W×3/4 uint8). ``region`` = (x0, y0, x1, y1) pixel rectangle to search.
+
+        ``thorough`` adds a coarse pass (huge display lettering) and, for small pictures, a fine pass (tiny captions)
+        on top of the normal one, for every loaded model."""
         h, w = rgb.shape[:2]
         ox = oy = 0
         if region is not None:
@@ -96,14 +120,40 @@ class TextDetector:
 
         boxes: list[TextBox] = []
         for (tx0, ty0, tx1, ty1) in self._tiles(w, h):
-            if cancel is not None and cancel():
-                break
             tile = img[ty0:ty1, tx0:tx1]
-            for b in self._detect_single(tile, box_thresh):
-                boxes.append(b.shifted(tx0 + ox, ty0 + oy))
-        boxes = _hysteresis(_suppress_duplicates(boxes), box_thresh)
+            for scale in self._scales(ty1 - ty0, tx1 - tx0, thorough):
+                for sess, name in self._sessions:
+                    if cancel is not None and cancel():
+                        break
+                    for b in self._detect_single(tile, box_thresh, sess, name, scale):
+                        boxes.append(b.shifted(tx0 + ox, ty0 + oy))
+        boxes = _merge_overlaps(_hysteresis(_suppress_duplicates(boxes), box_thresh))
         boxes.sort(key=lambda b: (round(b.xyxy()[1] / 12.0), b.xyxy()[0]))
         return boxes
+
+    def text_score(self, rgb: np.ndarray, poly: np.ndarray, text_h: float) -> float:
+        """How strongly the detectors still see text inside ``poly`` (polygon in the pixel coordinates of ``rgb``).
+
+        This is the "did it work?" question for an erase mask: the crop is shown to every model at the size the text
+        is normally read at, and the best score of any box whose centre lies inside ``poly`` is returned (``0.0`` when
+        nothing is found). Text that is really gone scores 0; a mask that missed the strokes scores like the original."""
+        h, w = rgb.shape[:2]
+        if h < 8 or w < 8:
+            return 0.0
+        img = np.ascontiguousarray(rgb[..., :3])
+        inside = np.zeros((h, w), np.uint8)
+        cv2.fillPoly(inside, [np.round(np.asarray(poly, np.float32)).astype(np.int32)], 255)
+        base = float(np.clip(32.0 / max(float(text_h), 4.0), 0.6, 3.0))
+        best = 0.0
+        for sess, name in self._sessions:
+            for scale in (base, base * 1.5):
+                scale = min(scale, self.max_side / float(max(h, w)))
+                for b in self._detect_single(img, 0.3, sess, name, scale):
+                    cx, cy = b.poly.mean(axis=0)
+                    ix, iy = int(cx), int(cy)
+                    if 0 <= ix < w and 0 <= iy < h and inside[iy, ix]:
+                        best = max(best, b.score)
+        return best
 
     # ----------------------------------------------------------------- internal
 
@@ -114,15 +164,27 @@ class TextDetector:
         ys = _spans(h, self.tile, self.tile_overlap)
         return [(x0, y0, x1, y1) for (y0, y1) in ys for (x0, x1) in xs]
 
-    def _detect_single(self, tile: np.ndarray, box_thresh: float) -> list[TextBox]:
+    def _scales(self, th: int, tw: int, thorough: bool) -> list[float]:
+        """Input scales for one tile: the normal one, plus a coarse (big text) and a fine (small text) one."""
+        base = 1.0
+        if min(th, tw) < self.limit_min_side:
+            base = self.limit_min_side / float(min(th, tw))
+        if max(th, tw) * base > self.max_side:
+            base = self.max_side / float(max(th, tw))
+        scales = [base]
+        if thorough:
+            coarse = min(base * 0.65, 640.0 / float(max(th, tw)))
+            if coarse * min(th, tw) >= 96 and coarse < base * 0.92:
+                scales.append(coarse)
+            if max(th, tw) * base * 1.6 <= 1800:
+                scales.append(base * 1.6)
+        return scales
+
+    def _detect_single(self, tile: np.ndarray, box_thresh: float, sess: ort.InferenceSession, name: str,
+                       scale: float) -> list[TextBox]:
         th, tw = tile.shape[:2]
         if th < 8 or tw < 8:
             return []
-        scale = 1.0
-        if min(th, tw) < self.limit_min_side:
-            scale = self.limit_min_side / float(min(th, tw))
-        if max(th, tw) * scale > self.max_side:
-            scale = self.max_side / float(max(th, tw))
         rh, rw = _round32(th * scale), _round32(tw * scale)
         interp = cv2.INTER_AREA if (rh < th or rw < tw) else cv2.INTER_LINEAR
         resized = cv2.resize(tile, (rw, rh), interpolation=interp)
@@ -130,7 +192,7 @@ class TextDetector:
         x = resized.astype(np.float32) * (1.0 / 255.0)
         x = (x - 0.5) / 0.5
         x = np.ascontiguousarray(x.transpose(2, 0, 1)[None])
-        prob = self._session.run(None, {self._input: x})[0][0, 0]   # InferenceSession.run is thread-safe
+        prob = sess.run(None, {name: x})[0][0, 0]   # InferenceSession.run is thread-safe
         return self._postprocess(prob, tw, th, weak_threshold(box_thresh))
 
     def _postprocess(self, prob: np.ndarray, orig_w: int, orig_h: int, min_score: float) -> list[TextBox]:
@@ -189,7 +251,8 @@ def _hysteresis(boxes: Sequence[TextBox], box_thresh: float) -> list[TextBox]:
                 sx0, sy0, sx1, sy1 = s.xyxy()
                 sh = sy1 - sy0
                 gap = max(sx0 - wx1, wx0 - sx1, 0.0)
-                if sy0 - 0.25 * sh <= wcy <= sy1 + 0.25 * sh and gap <= 1.0 * sh:
+                small = (wy1 - wy0) <= 1.0 * sh and (wx1 - wx0) <= 2.5 * sh       # a fragment, not a line or blob
+                if small and sy0 - 0.25 * sh <= wcy <= sy1 + 0.25 * sh and gap <= 1.0 * sh:
                     taken[id(w)] = _widen_fragment(w, s)
                     break
         if not taken:
@@ -236,10 +299,12 @@ def _box_score(prob: np.ndarray, pts: np.ndarray) -> float:
 
 
 def _suppress_duplicates(boxes: Sequence[TextBox]) -> list[TextBox]:
-    """Drop boxes (from overlapping tiles) that are mostly covered by a bigger box."""
+    """Drop boxes that are mostly covered by a better one (the same text found by another pass, model or tile).
+
+    Best score first, so a confident small box is never swallowed by a bigger but doubtful one."""
     if len(boxes) < 2:
         return list(boxes)
-    order = sorted(range(len(boxes)), key=lambda i: -boxes[i].area())
+    order = sorted(range(len(boxes)), key=lambda i: (-boxes[i].score, -boxes[i].area()))
     kept: list[TextBox] = []
     for i in order:
         b = boxes[i]
@@ -256,3 +321,56 @@ def _suppress_duplicates(boxes: Sequence[TextBox]) -> list[TextBox]:
         if not dup:
             kept.append(b)
     return kept
+
+
+def _axis_aligned(b: TextBox) -> bool:
+    ang = cv2.minAreaRect(b.poly.astype(np.float32))[2] % 90.0
+    return ang < 4.0 or ang > 86.0
+
+
+def _merge_overlaps(boxes: Sequence[TextBox]) -> list[TextBox]:
+    """One box per text line: overlapping axis-aligned boxes (the same line seen by different passes / models, each
+    with slightly different reach and height) become one box — the widest horizontal reach of the group, with the
+    typical (median) vertical extent. Rotated boxes are left alone."""
+    n = len(boxes)
+    if n < 2:
+        return list(boxes)
+    rects = [b.xyxy() for b in boxes]
+    flat = [_axis_aligned(b) for b in boxes]
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        if not flat[i]:
+            continue
+        for j in range(i + 1, n):
+            if not flat[j]:
+                continue
+            ax0, ay0, ax1, ay1 = rects[i]
+            bx0, by0, bx1, by1 = rects[j]
+            iw, ih = min(ax1, bx1) - max(ax0, bx0), min(ay1, by1) - max(ay0, by0)
+            if iw <= 0 or ih <= 0:
+                continue
+            small = min((ax1 - ax0) * (ay1 - ay0), (bx1 - bx0) * (by1 - by0))
+            if iw * ih >= 0.5 * small and ih >= 0.6 * min(ay1 - ay0, by1 - by0):
+                parent[find(i)] = find(j)
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    out: list[TextBox] = []
+    for members in groups.values():
+        if len(members) == 1:
+            out.append(boxes[members[0]])
+            continue
+        xs0 = min(rects[i][0] for i in members)
+        xs1 = max(rects[i][2] for i in members)
+        ys0 = float(np.median([rects[i][1] for i in members]))
+        ys1 = float(np.median([rects[i][3] for i in members]))
+        poly = np.array([[xs0, ys0], [xs1, ys0], [xs1, ys1], [xs0, ys1]], np.float32)
+        out.append(TextBox(poly, max(boxes[i].score for i in members)))
+    return out

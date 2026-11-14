@@ -11,8 +11,9 @@ from typing import Callable, Optional, Sequence
 import cv2
 import numpy as np
 
-from .neural import NeuralInpainter
+from .neural import InpaintEngine
 from .textdet import TextBox, TextDetector
+from .texture import grain as _grain, ring_noise_sigma as _ring_noise_sigma
 
 Rect = tuple[int, int, int, int]          # x0, y0, x1, y1 (pixels)
 RelRect = tuple[float, float, float, float]   # x, y, w, h (0‥1)
@@ -21,11 +22,16 @@ RelRect = tuple[float, float, float, float]   # x, y, w, h (0‥1)
 @dataclass
 class EraseOptions:
     box_thresh: float = 0.5          # detector confidence threshold
+    thorough: bool = True            # detector: extra scales for huge / tiny text (a bit slower)
     pad: float = 0.15                # grow each box by this × text height before looking for strokes
-    grow: float = 0.12               # dilate the stroke mask by this × text height (covers anti-alias halos)
+    grow: float = 0.12               # flat / smooth backgrounds: dilate the stroke mask by this × text height
+    grow_textured: float = 0.10      # busy backgrounds: same, but the stroke mask is exact there, so it is smaller
     whole_box: bool = False          # fill entire boxes instead of just glyph strokes
     side_glyphs: bool = True         # also take small symbols (©, •, @ …) hugging the end of a detected line
     fast_radius: int = 3             # OpenCV inpaint radius
+    engine: str = "auto"             # auto | fast | migan | lama — which fill engine the caller resolved (see ModelManager)
+    verify: bool = True              # busy backgrounds: let the text detector confirm that a mask really hides the text
+    verify_below: float = 0.25       # ... a mask passes when the best detector score left inside the box is under this
     use_neural: bool = True          # allow the neural model (when installed) on complex backgrounds
     always_neural: bool = False      # force the neural model for every box (slower)
     complexity_texture: float = 7.0  # background "fine detail" above this       -> complex
@@ -58,8 +64,38 @@ def _odd(v: int) -> int:
     return v if v % 2 == 1 else v + 1
 
 
-def build_stroke_mask(rgb: np.ndarray, boxes: Sequence[TextBox], opts: EraseOptions) -> np.ndarray:
-    """Return a full-size uint8 mask (0/255) of the glyph strokes inside ``boxes``."""
+# a mask candidate must show this much more "ink" density inside the text box than around it
+_MIN_CONTRAST = 1.8
+
+Verifier = Callable[[np.ndarray, np.ndarray, np.ndarray, float], float]     # (roi, mask, box polygon, text height) -> residual
+
+
+class _MaskVerifier:
+    """Asks the text detector whether a candidate mask really hides the text.
+
+    The candidate is painted over with the cheap OpenCV fill and the result is shown to the detector: text that is
+    gone scores 0, a mask that missed the strokes (or picked the wrong colour) scores like the original."""
+
+    def __init__(self, detector: TextDetector, radius: int = 3):
+        self.detector = detector
+        self.radius = max(1, int(radius))
+
+    def __call__(self, roi: np.ndarray, mask: np.ndarray, poly: np.ndarray, text_h: float) -> float:
+        filled = cv2.inpaint(np.ascontiguousarray(roi), mask, self.radius, cv2.INPAINT_TELEA)
+        return self.detector.text_score(filled, poly, text_h)
+
+
+def build_stroke_mask(rgb: np.ndarray, boxes: Sequence[TextBox], opts: EraseOptions,
+                      verifier: Optional[Verifier] = None) -> np.ndarray:
+    """Return a full-size uint8 mask (0/255) of the glyph strokes inside ``boxes``.
+
+    The strokes are found one of three ways (see :func:`_stroke_candidates`). On busy backgrounds the mask is exact
+    (the text's own colour, thin structures only) and therefore grown only a little; on flat or smooth backgrounds it
+    is grown generously, because filling there is cheap and invisible.
+
+    With a ``verifier`` every candidate found on a busy background is checked: the first one after which the detector
+    no longer sees text wins. When none passes, the whole (slightly padded) box is masked — a coarse fill beats text
+    that is still there."""
     H, W = rgb.shape[:2]
     mask = np.zeros((H, W), np.uint8)
     for box in boxes:
@@ -67,36 +103,54 @@ def build_stroke_mask(rgb: np.ndarray, boxes: Sequence[TextBox], opts: EraseOpti
         (cx, cy), (rw, rh), ang = rect
         text_h = max(min(rw, rh), 4.0)
         pad = opts.pad * text_h
-        grown = ((cx, cy), (rw + 2 * pad, rh + 2 * pad), ang)
-        poly = cv2.boxPoints(grown)
-        g = int(np.clip(round(opts.grow * text_h), 1, 10))
+        g_flat = int(np.clip(round(opts.grow * text_h), 1, 10))
+        g_tex = int(np.clip(round(opts.grow_textured * text_h), 2, 8))
+        g = max(g_flat, g_tex)
+        ring_w = 0.6 * text_h
+        poly = cv2.boxPoints(((cx, cy), (rw + 2 * pad, rh + 2 * pad), ang))
+        ring_poly = cv2.boxPoints(((cx, cy), (rw + 2 * (pad + ring_w), rh + 2 * (pad + ring_w)), ang))
 
-        x0 = int(max(0, np.floor(poly[:, 0].min()) - g - 2))
-        y0 = int(max(0, np.floor(poly[:, 1].min()) - g - 2))
-        x1 = int(min(W, np.ceil(poly[:, 0].max()) + g + 3))
-        y1 = int(min(H, np.ceil(poly[:, 1].max()) + g + 3))
+        x0 = int(max(0, np.floor(ring_poly[:, 0].min()) - g - 2))
+        y0 = int(max(0, np.floor(ring_poly[:, 1].min()) - g - 2))
+        x1 = int(min(W, np.ceil(ring_poly[:, 0].max()) + g + 3))
+        y1 = int(min(H, np.ceil(ring_poly[:, 1].max()) + g + 3))
         if x1 - x0 < 3 or y1 - y0 < 3:
             continue
 
-        local = poly - np.array([x0, y0], dtype=np.float32)
-        region = np.zeros((y1 - y0, x1 - x0), np.uint8)
-        cv2.fillPoly(region, [np.round(local).astype(np.int32)], 255)
+        off = np.array([x0, y0], dtype=np.float32)
+        shape = (y1 - y0, x1 - x0)
 
-        strokes = None
-        if not opts.whole_box:
-            strokes = _strokes_in_region(np.ascontiguousarray(rgb[y0:y1, x0:x1]), region, text_h, pad)
-        if strokes is None:
-            strokes = region.copy()
-        else:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * g + 1, 2 * g + 1))
-            strokes = cv2.dilate(strokes, k)
-            strokes = cv2.morphologyEx(strokes, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+        def fill(pts: np.ndarray) -> np.ndarray:
+            m = np.zeros(shape, np.uint8)
+            cv2.fillPoly(m, [np.round(pts - off).astype(np.int32)], 255)
+            return m
+
+        region = fill(poly)
+        roi = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+
+        def grown(strokes: np.ndarray, kind: str) -> np.ndarray:
+            gk = g_flat if kind == "plane" else g_tex
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * gk + 1, 2 * gk + 1))
+            out = cv2.dilate(strokes, k)
+            out = cv2.morphologyEx(out, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
             # a speck of glyph colour left inside a thick letter would be *propagated* by the fill — close such holes
-            strokes = _fill_small_holes(strokes, (0.5 * text_h) ** 2)
+            out = _fill_small_holes(out, (0.5 * text_h) ** 2)
             # never leak past the (slightly grown) box
-            limit = cv2.dilate(region, k)
-            strokes = cv2.bitwise_and(strokes, limit)
-        mask[y0:y1, x0:x1] |= strokes
+            return cv2.bitwise_and(out, cv2.dilate(region, k))
+
+        chosen: Optional[np.ndarray] = None
+        if not opts.whole_box:
+            core = fill(cv2.boxPoints(rect))
+            ring = (fill(ring_poly) > 0) & (cv2.dilate(core, np.ones((7, 7), np.uint8)) == 0)
+            for strokes, kind in _stroke_candidates(roi, region, text_h, pad, core > 0, ring):
+                cand = grown(strokes, kind)
+                if verifier is None or kind == "plane":
+                    chosen = cand
+                    break
+                if verifier(roi, cand, poly - off, text_h) < opts.verify_below:
+                    chosen = cand
+                    break
+        mask[y0:y1, x0:x1] |= (chosen if chosen is not None else region)
     return mask
 
 
@@ -160,11 +214,123 @@ def _strokes_from_diff(diff: np.ndarray, inside: np.ndarray, floor: float) -> Op
     return strokes
 
 
-def _strokes_in_region(roi: np.ndarray, region: np.ndarray, text_h: float, pad: float = 0.0) -> Optional[np.ndarray]:
-    """Glyph strokes = pixels that differ from the background.
+def _smooth3(h: np.ndarray) -> np.ndarray:
+    """[1 2 1]/4 smoothing of a 3-D histogram along every axis (colours next to a bin edge count for both bins)."""
+    for ax in range(3):
+        p = np.pad(h, [(1, 1) if a == ax else (0, 0) for a in range(3)], mode="edge")
+        n = h.shape[ax]
+        sl = lambda o: tuple(slice(o, o + n) if a == ax else slice(None) for a in range(3))   # noqa: E731
+        h = (p[sl(0)] + 2 * p[sl(1)] + p[sl(2)]) / 4.0
+    return h
 
-    1. Flat / smooth surroundings: distance to a plane fitted on the padding band (robust to dense, heavy glyphs).
-    2. Anything else: distance to a local median of a window ≥ the text height."""
+
+def ink_candidates(roi: np.ndarray, core: np.ndarray, ring: np.ndarray, limit: int = 8) -> list[np.ndarray]:
+    """Colours the text inside ``core`` (boolean mask of the text box) might have, judged against ``ring``.
+
+    Two sources: colours clearly more frequent inside the box than around it (a flat ink stands out in that
+    comparison — fine bins for bold text, coarse bins for thin, soft text) and the brightest / darkest few per cent
+    of the box (most overlay text is white or black, and thin anti-aliased strokes smear over many colour bins).
+    None of them is trusted blindly: :func:`_stroke_candidates` ranks them by how text-like their strokes look."""
+    out: list[np.ndarray] = []
+    if int(core.sum()) < 40 or int(ring.sum()) < 40:
+        return out
+
+    def add(c: np.ndarray) -> None:
+        c = np.asarray(c, np.float32)
+        if all(float(np.linalg.norm(c - d)) > 28.0 for d in out):
+            out.append(c)
+
+    for levels, shift in ((16, 4), (8, 5)):
+        q = (roi >> shift).astype(np.int32)
+        idx = (q[..., 0] * levels + q[..., 1]) * levels + q[..., 2]
+        nb = levels ** 3
+        hin = np.bincount(idx[core], minlength=nb).astype(np.float64)
+        hout = np.bincount(idx[ring], minlength=nb).astype(np.float64)
+        hin /= max(hin.sum(), 1.0)
+        hout /= max(hout.sum(), 1.0)
+        diff = (_smooth3(hin.reshape(levels, levels, levels)) - _smooth3(hout.reshape(levels, levels, levels))).reshape(-1)
+        taken = 0
+        for k in np.argsort(-diff)[:40]:
+            if diff[k] < 0.002 or taken >= 3:
+                break
+            r, g, b = int(k) // (levels * levels), (int(k) // levels) % levels, int(k) % levels
+            near = core & (np.abs(q[..., 0] - r) <= 1) & (np.abs(q[..., 1] - g) <= 1) & (np.abs(q[..., 2] - b) <= 1)
+            if int(near.sum()) < 8:
+                continue
+            before = len(out)
+            add(np.median(roi[near].astype(np.float32), axis=0))
+            taken += len(out) - before
+    lum = roi.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    lv = lum[core]
+    if lv.size >= 50:
+        for sel in (core & (lum >= np.percentile(lv, 96)), core & (lum <= np.percentile(lv, 4))):
+            if int(sel.sum()) >= 8:
+                add(np.median(roi[sel].astype(np.float32), axis=0))
+    return out[:limit + 2]
+
+
+def _strokes_for_ink(roi: np.ndarray, region: np.ndarray, core: np.ndarray, ring: np.ndarray, text_h: float,
+                     ink: np.ndarray) -> Optional[tuple[np.ndarray, float]]:
+    """Glyph strokes on a *busy* background for one candidate ink colour: ``(strokes, contrast)`` or ``None``.
+
+    Text is (nearly) one flat colour and made of thin strokes; the background is neither. So: take the pixels close to
+    the ink colour, keep only those that stand out from their surroundings, throw away everything thicker than a
+    stroke (a big light patch of the picture has the same colour as white text but is not a stroke) and every speck.
+    ``contrast`` is how much denser those strokes are inside the text box than around it — text-likeness."""
+    px = roi[core].astype(np.float32)
+    dd = np.linalg.norm(px - ink, axis=1)
+    spread = float(np.median(np.sort(dd)[:max(8, dd.size // 20)]))      # how tightly the closest 5 % hug the colour
+    bg_med = np.median(roi[ring], axis=0)
+    if float(np.abs(ink - bg_med).max()) < 40.0:
+        return None                                       # ink hardly differs from its surroundings
+    tol_loose = float(np.clip(2.0 * spread + 22.0, 28.0, 48.0))
+    tol_strict = float(np.clip(1.2 * spread + 14.0, 22.0, 34.0))
+    dist = np.linalg.norm(roi.astype(np.float32) - ink[None, None, :], axis=2)
+    loose = (dist <= tol_loose).astype(np.uint8)          # whole window: look-alike areas must be seen in full
+    dt = cv2.distanceTransform(loose, cv2.DIST_L2, 3)
+    inreg = region > 0
+    ridge = (dt > 0.5) & (dt >= cv2.dilate(dt, np.ones((3, 3), np.uint8)) - 1e-6) & inreg & (loose > 0) & core
+    if int(ridge.sum()) < 10:
+        return None
+    half_w = float(np.percentile(dt[ridge], 75))          # typical half stroke width
+    r_thick = int(np.clip(round(2.0 * half_w + 1.0), 2, max(2, round(0.2 * text_h))))
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r_thick + 1, 2 * r_thick + 1))
+    thick = cv2.dilate(cv2.morphologyEx(loose, cv2.MORPH_OPEN, k), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    # soft anti-aliased edge pixels only count right next to pixels that really have the ink colour
+    strict = (dist <= tol_strict).astype(np.uint8)
+    near = cv2.dilate(strict, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    cand = strict | (loose & near)
+    # the ink must stand out from its neighbourhood (a pale patch beside other pale patches is not text)
+    lum_w = np.array([0.299, 0.587, 0.114], np.float32)
+    lum = roi.astype(np.float32) @ lum_w
+    ink_l, ring_l = float(ink @ lum_w), float(np.median(lum[ring]))
+    if abs(ink_l - ring_l) >= 25.0:
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * (r_thick + 1) + 1, 2 * (r_thick + 1) + 1))
+        top = (lum - cv2.morphologyEx(lum, cv2.MORPH_OPEN, se)) if ink_l > ring_l else (cv2.morphologyEx(lum, cv2.MORPH_CLOSE, se) - lum)
+        cand = cand & (top >= float(np.clip(0.3 * abs(ink_l - ring_l), 12.0, 60.0))).astype(np.uint8)
+    thin = cand & (1 - thick)
+    n, lab, stats, _c = cv2.connectedComponentsWithStats(thin, connectivity=8)
+    keep = np.zeros(n, bool)
+    keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= max(4.0, 0.002 * text_h * text_h)
+    found = keep[lab]
+    strokes = (found & inreg).astype(np.uint8) * 255
+    ratio = float((strokes > 0).sum()) / float(max(int(inreg.sum()), 1))
+    if ratio < 0.01 or ratio > 0.55:
+        return None
+    dens_core = float((found & core).sum()) / max(int(core.sum()), 1)
+    dens_ring = float((found & ring).sum()) / max(int(ring.sum()), 1)
+    return strokes, dens_core / (dens_ring + 0.01)
+
+
+def _stroke_candidates(roi: np.ndarray, region: np.ndarray, text_h: float, pad: float = 0.0,
+                       core: Optional[np.ndarray] = None, ring: Optional[np.ndarray] = None):
+    """Yield ``(mask, how)`` — possible glyph-stroke masks, most plausible first. ``how`` is
+
+    * ``"plane"``  — flat / smooth surroundings: distance to a plane fitted on the padding band (robust to dense,
+      heavy glyphs); the only candidate when it applies;
+    * ``"ink"``    — busy surroundings: the text's own colour, thin structures only (:func:`_strokes_for_ink`), one
+      candidate per plausible colour, the most text-like first;
+    * ``"median"`` — last resort: distance to a local median of a window ≥ the text height."""
     inside = region > 0
     if pad >= 2.0:
         model = _band_background(roi, region, pad)
@@ -173,17 +339,29 @@ def _strokes_in_region(roi: np.ndarray, region: np.ndarray, text_h: float, pad: 
             diff = np.abs(roi.astype(np.float32) - bg).max(axis=2)
             strokes = _strokes_from_diff(diff, inside, floor=max(8.0, 5.0 + 4.0 * sigma))
             if strokes is not None:
-                return strokes
+                yield strokes, "plane"
+                return
+    if core is not None and ring is not None:
+        ranked = []
+        for ink in ink_candidates(roi, core, ring):
+            got = _strokes_for_ink(roi, region, core, ring, text_h, ink)
+            if got is not None and got[1] >= _MIN_CONTRAST:
+                ranked.append(got)
+        ranked.sort(key=lambda t: -t[1])
+        for strokes, _contrast in ranked:
+            yield strokes, "ink"
     k = _odd(int(np.clip(text_h * 0.9, 11, 121)))
     k = min(k, _odd(max(3, min(roi.shape[:2]) // 1)))
     if k < 3:
-        return None
+        return
     bg = cv2.medianBlur(roi, k if k <= 255 else 255)
     diff = cv2.absdiff(roi, bg).max(axis=2).astype(np.float32)
     vals = diff[inside]
     if vals.size < 16:
-        return None
-    return _strokes_from_diff(diff, inside, floor=max(float(np.median(vals)) * 2.5 + 3.0, 8.0))
+        return
+    strokes = _strokes_from_diff(diff, inside, floor=max(float(np.median(vals)) * 2.5 + 3.0, 8.0))
+    if strokes is not None:
+        yield strokes, "median"
 
 
 # ------------------------------------------------- symbols the detector has no response for
@@ -386,17 +564,6 @@ def background_complexity(rgb: np.ndarray, mask: np.ndarray, bbox: Rect) -> tupl
     return float(hf[ring].mean()), float((grad[ring] > 150.0).sum())
 
 
-def _ring_noise_sigma(roi: np.ndarray, mask: np.ndarray) -> float:
-    gray = cv2.cvtColor(roi, cv2.COLOR_RGB2GRAY).astype(np.float32)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    ring = (cv2.dilate(mask, kernel, iterations=4) > 0) & (cv2.dilate(mask, kernel, iterations=1) == 0)
-    if int(ring.sum()) < 30:
-        return 0.0
-    hf = (gray - cv2.GaussianBlur(gray, (0, 0), 1.0))[ring]
-    mad = float(np.median(np.abs(hf - np.median(hf))))
-    return 1.4826 * mad
-
-
 def fast_fill(rgb: np.ndarray, mask: np.ndarray, bbox: Rect, radius: int,
               rng: Optional[np.random.Generator] = None) -> None:
     """Telea inpainting on the masked pixels of ``rgb`` (edited in place) + grain matched to the surroundings."""
@@ -411,11 +578,7 @@ def fast_fill(rgb: np.ndarray, mask: np.ndarray, bbox: Rect, radius: int,
     sel = m > 0
     if sigma > 0.7:
         rng = rng or np.random.default_rng(1234)
-        h, w = m.shape
-        lum = rng.normal(0.0, sigma, (h, w, 1)).astype(np.float32)
-        chroma = rng.normal(0.0, sigma * 0.35, (h, w, 3)).astype(np.float32)
-        noise = cv2.GaussianBlur(lum + chroma, (0, 0), 0.55).reshape(h, w, 3) * 1.25
-        vals = filled.astype(np.float32) + noise
+        vals = filled.astype(np.float32) + _grain(m.shape, sigma, rng)
         filled = np.where(sel[..., None], np.clip(vals, 0, 255), filled).astype(np.uint8)
     view = rgb[y0:y1, x0:x1]
     view[sel] = filled[sel]
@@ -425,7 +588,7 @@ def fast_fill(rgb: np.ndarray, mask: np.ndarray, bbox: Rect, radius: int,
 
 class TextEraser:
     def __init__(self, detector: Optional[TextDetector] = None,
-                 neural: Optional[NeuralInpainter] = None):
+                 neural: Optional[InpaintEngine] = None):
         self.detector = detector
         self.neural = neural
         self._rng = np.random.default_rng(20241114)
@@ -439,7 +602,8 @@ class TextEraser:
                opts: Optional[EraseOptions] = None,
                cancel: Optional[Callable[[], bool]] = None) -> list[TextBox]:
         opts = opts or EraseOptions()
-        boxes = self.ensure_detector().detect(rgba, box_thresh=opts.box_thresh, region=region, cancel=cancel)
+        boxes = self.ensure_detector().detect(rgba, box_thresh=opts.box_thresh, region=region, cancel=cancel,
+                                              thorough=opts.thorough)
         if opts.side_glyphs and boxes and not (cancel is not None and cancel()):
             extra = glyphs_beside_lines(rgba, boxes, opts.box_thresh, region)
             if extra:
@@ -462,23 +626,31 @@ class TextEraser:
         rgb = out[..., :3]
         H, W = rgb.shape[:2]
         work = np.ascontiguousarray(rgb)
-        mask = build_stroke_mask(work, boxes, opts)
+        verifier: Optional[Verifier] = None
+        if opts.verify and not opts.whole_box:
+            try:
+                verifier = _MaskVerifier(self.ensure_detector(), opts.fast_radius)
+            except Exception:                  # no detector available: masks are simply taken as found
+                verifier = None
+        mask = build_stroke_mask(work, boxes, opts, verifier)
 
-        use_neural = self.neural is not None and (opts.use_neural or opts.always_neural)
+        use_neural = (self.neural is not None and opts.engine != "fast"
+                      and (opts.use_neural or opts.always_neural))
         rects: list[Rect] = []
         for b in boxes:
             x0, y0, x1, y1 = b.xyxy()
             pad = int(opts.pad * b.height) + 12
             rects.append((max(0, int(x0) - pad), max(0, int(y0) - pad),
                           min(W, int(x1) + pad), min(H, int(y1) + pad)))
-        clusters = cluster_rects(rects, max_span=380 if use_neural else 160, gap=4)
+        # the network works window by window (large areas are tiled), so only text that really touches is grouped;
+        # the OpenCV fill stays on small groups
+        clusters = cluster_rects(rects, max_span=0 if use_neural else 160, gap=10 if use_neural else 4)
 
         neural_count = fast_count = 0
         note = None
         total = len(clusters)
         # the network gets a slightly bigger mask so it has room to hide anti-alias halos
-        grown_all = (cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
-                     if use_neural else None)
+        grown_all = (cv2.dilate(mask, np.ones((3, 3), np.uint8)) if use_neural else None)
         for i, area in enumerate(clusters):
             if cancel is not None and cancel():
                 note = "canceled"
@@ -487,17 +659,18 @@ class TextEraser:
             if bbox is not None:
                 go_neural = False
                 if use_neural:
-                    if opts.always_neural:
+                    if opts.always_neural or opts.engine in ("lama", "migan"):
                         go_neural = True
                     else:
                         tex, edge = background_complexity(work, mask, bbox)
                         go_neural = tex > opts.complexity_texture or edge >= opts.complexity_edge
                 if go_neural:
                     try:
-                        wx0, wy0, wx1, wy1 = self.neural.inpaint(work, grown_all, bbox)   # type: ignore[union-attr]
-                        # everything masked inside that window is done now
+                        nb = _mask_bbox(grown_all, area) or bbox                         # type: ignore[arg-type]
+                        wx0, wy0, wx1, wy1 = self.neural.inpaint(work, grown_all, nb)    # type: ignore[union-attr]
+                        # everything masked inside that area is done now
                         mask[wy0:wy1, wx0:wx1] = 0
-                        grown_all[wy0:wy1, wx0:wx1] = 0
+                        grown_all[wy0:wy1, wx0:wx1] = 0                                  # type: ignore[index]
                         neural_count += 1
                     except Exception as exc:       # model hiccup -> fall back, never lose the job
                         fast_fill(work, mask, bbox, opts.fast_radius, self._rng)

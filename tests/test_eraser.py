@@ -3,6 +3,7 @@ import pytest
 
 from conftest import gradient_bg, with_text
 from rubberstudio.core.eraser import EraseOptions, TextEraser, glyphs_beside_lines, rel_to_px, build_stroke_mask
+from rubberstudio.core.textdet import TextDetector
 
 
 def rgba(a):
@@ -169,11 +170,15 @@ def test_model_path_with_non_ascii_characters(tmp_path, clean_and_text):
 
 # ------------------------------------------------------ symbols the detector does not see (©, •, @ ...)
 
-def test_side_glyph_step_can_be_switched_off(detector):
+def test_side_glyph_step_can_be_switched_off():
+    """With the single PP-OCRv4 model on its normal scale (the detector that has no response for the '©') the symbol
+    next to the watermark is only found by the side-glyph step; it must be switchable."""
+    from rubberstudio.core.textdet import default_model_path
     from rubberstudio.demo import make_demo_image
     demo = make_demo_image()
-    on = TextEraser(detector).detect(demo, opts=EraseOptions())
-    off = TextEraser(detector).detect(demo, opts=EraseOptions(side_glyphs=False))
+    single = TextDetector(default_model_path())
+    on = TextEraser(single).detect(demo, opts=EraseOptions(thorough=False))
+    off = TextEraser(single).detect(demo, opts=EraseOptions(thorough=False, side_glyphs=False))
     assert len(on) == len(off) + 1, "the '©' in front of the watermark is only found by the side-glyph step"
 
 
