@@ -35,8 +35,9 @@ jobs:
           python -m pip freeze > requirements-lock.txt
 
       - name: Run tests
-        # Informational: the gate for shipping is the self-test of the *built* program below, which exercises the
-        # same engine, batch runner and GUI inside the real executable.
+        id: tests
+        # Keep going so one run shows everything (build, self-test of the real exe, screenshots); the job is failed
+        # by the last step and a release is never published when the tests did not pass.
         continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
@@ -100,16 +101,25 @@ jobs:
           retention-days: 30
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: windows-screenshots-and-selftest
           path: |
             shots/
             requirements-lock.txt
+          if-no-files-found: ignore
           retention-days: 30
 
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/v') && steps.tests.outcome == 'success'
         uses: softprops/action-gh-release@v2
         with:
           files: RubberStudio-*-windows-x64.zip
           generate_release_notes: true
+
+      - name: Fail the job when the tests failed
+        if: steps.tests.outcome == 'failure'
+        shell: pwsh
+        run: |
+          Write-Error "the test suite failed - see the 'Run tests' step"
+          exit 1

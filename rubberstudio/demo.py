@@ -9,15 +9,20 @@ from .core.paths import resource_path
 DEMO_TEXTS = ("SUMMER SALE 50% OFF", "www.example-shop.com", "© 2026 Sample Studio")
 
 
-def _font(name: str, size: int) -> ImageFont.FreeTypeFont:
+def _font(name: str, size: int, basic_layout: bool = True) -> ImageFont.FreeTypeFont:
+    """Bundled font. The basic layout engine is forced: with Raqm (present in Pillow on some systems, absent on
+    others, e.g. plain Windows) the glyph advances differ by a fraction of a pixel and the picture would not be
+    pixel-identical from one machine to the next — which the self-test, the screenshots and the tests rely on."""
     path = resource_path("assets", "fonts", name)
     try:
+        if basic_layout:
+            return ImageFont.truetype(str(path), size, layout_engine=ImageFont.Layout.BASIC)
         return ImageFont.truetype(str(path), size)
     except OSError:
         return ImageFont.load_default(size=size)       # type: ignore[return-value]
 
 
-def make_demo_image(w: int = 1280, h: int = 800, seed: int = 7) -> np.ndarray:
+def make_demo_image(w: int = 1280, h: int = 800, seed: int = 7, basic_layout: bool = True) -> np.ndarray:
     """RGBA uint8 picture: sky gradient, sun, hills and three different kinds of text."""
     rng = np.random.default_rng(seed)
     yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
@@ -41,16 +46,16 @@ def make_demo_image(w: int = 1280, h: int = 800, seed: int = 7) -> np.ndarray:
     over = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     d = ImageDraw.Draw(over)
     # 1: big banner text on a colour stripe
-    big = _font("ArchivoBlack-Regular.ttf", int(h * 0.088))
+    big = _font("ArchivoBlack-Regular.ttf", int(h * 0.088), basic_layout)
     tw = d.textlength(DEMO_TEXTS[0], font=big)
     x0, y0 = int(w * 0.06), int(h * 0.1)
     d.rectangle((x0 - 18, y0 - 10, x0 + tw + 18, y0 + int(h * 0.088) + 22), fill=(240, 69, 42, 235))
     d.text((x0, y0), DEMO_TEXTS[0], font=big, fill=(255, 250, 235, 255))
     # 2: small dark caption on bright sky
-    cap = _font("SpaceMono-Bold.ttf", int(h * 0.034))
+    cap = _font("SpaceMono-Bold.ttf", int(h * 0.034), basic_layout)
     d.text((int(w * 0.07), int(h * 0.27)), DEMO_TEXTS[1], font=cap, fill=(28, 26, 23, 255))
     # 3: semi-transparent white "watermark" low on the picture
-    wm = _font("SpaceMono-Bold.ttf", int(h * 0.03))
+    wm = _font("SpaceMono-Bold.ttf", int(h * 0.03), basic_layout)
     tw3 = d.textlength(DEMO_TEXTS[2], font=wm)
     d.text((w - tw3 - int(w * 0.04), int(h * 0.92)), DEMO_TEXTS[2], font=wm, fill=(255, 255, 255, 170))
     out = Image.alpha_composite(base, over)

@@ -24,6 +24,7 @@ class EraseOptions:
     pad: float = 0.15                # grow each box by this × text height before looking for strokes
     grow: float = 0.12               # dilate the stroke mask by this × text height (covers anti-alias halos)
     whole_box: bool = False          # fill entire boxes instead of just glyph strokes
+    side_glyphs: bool = True         # also take small symbols (©, •, @ …) hugging the end of a detected line
     fast_radius: int = 3             # OpenCV inpaint radius
     use_neural: bool = True          # allow the neural model (when installed) on complex backgrounds
     always_neural: bool = False      # force the neural model for every box (slower)
@@ -185,6 +186,133 @@ def _strokes_in_region(roi: np.ndarray, region: np.ndarray, text_h: float, pad: 
     return _strokes_from_diff(diff, inside, floor=max(float(np.median(vals)) * 2.5 + 3.0, 8.0))
 
 
+# ------------------------------------------------- symbols the detector has no response for
+
+_SIDE_REACH = 2.0      # look up to this many line heights beside a text line ...
+_SIDE_GAP = 1.0        # ... for symbols starting within this many line heights of the line end (or of the previous one)
+_SIDE_MAX = 4          # at most this many symbols per line end
+_SIDE_MAX_SIGMA = 5.0  # background must be this smooth (residual of a plane fitted around the line, in grey levels)
+
+
+def _is_horizontal_line(box: TextBox) -> bool:
+    x0, y0, x1, y1 = box.xyxy()
+    if (x1 - x0) < 1.2 * (y1 - y0):
+        return False
+    ang = cv2.minAreaRect(box.poly.astype(np.float32))[2] % 90.0
+    return ang < 5.0 or ang > 85.0
+
+
+def glyphs_beside_lines(rgb: np.ndarray, boxes: Sequence[TextBox], box_thresh: float,
+                        bounds: Optional[Rect] = None) -> list[TextBox]:
+    """Small symbols (©, ®, •, @ …) right beside a text line that the detector gave no response for at all.
+
+    The network ignores some isolated tiny glyphs — and whether it does depends on pixel-level details such as how the
+    font was rasterised — so they would be the speck left behind next to an otherwise clean line. Pixels beside the end
+    of a confident, horizontal line are therefore checked directly: a compact blob of the *same ink colour*, glyph-sized
+    (clearly smaller than the line), sitting on the line and close to it, counts as part of the text. Anything bigger
+    (icons, objects), another colour, off the line or far away is left alone — and so is anything on a busy background."""
+    H, W = rgb.shape[:2]
+    bx0, by0, bx1, by1 = bounds if bounds is not None else (0, 0, W, H)
+    bx0, by0, bx1, by1 = max(0, bx0), max(0, by0), min(W, bx1), min(H, by1)
+    rects = [list(b.xyxy()) for b in boxes]
+    found: list[TextBox] = []
+    for b in boxes:
+        if b.score < box_thresh or not _is_horizontal_line(b):
+            continue
+        x0, y0, x1, y1 = b.xyxy()
+        bh, bw = y1 - y0, x1 - x0
+        if bh < 10 or bw > 40 * bh:
+            continue
+        reach = int(round(_SIDE_REACH * bh))
+        band_pad = int(round(0.1 * bh))
+        rx0, rx1 = max(bx0, int(np.floor(x0)) - reach), min(bx1, int(np.ceil(x1)) + reach)
+        ry0, ry1 = max(by0, int(np.floor(y0)) - band_pad), min(by1, int(np.ceil(y1)) + band_pad)
+        if rx1 - rx0 < 8 or ry1 - ry0 < 8:
+            continue
+        m = 3
+        ox0, oy0 = max(0, rx0 - m), max(0, ry0 - m)
+        ox1, oy1 = min(W, rx1 + m), min(H, ry1 + m)
+        roi = np.ascontiguousarray(rgb[oy0:oy1, ox0:ox1, :3])
+        region = np.zeros(roi.shape[:2], np.uint8)
+        region[ry0 - oy0:ry1 - oy0, rx0 - ox0:rx1 - ox0] = 255
+        # Only on flat or smoothly shaded surroundings, where "differs from the background" really means "is ink".
+        # Photos / busy textures are skipped: there every speck would look like a symbol.
+        model = _band_background(roi, region, 0.15 * bh)
+        if model is None or model[1] > _SIDE_MAX_SIGMA:
+            continue
+        bg, sigma = model
+        diff = np.abs(roi.astype(np.float32) - bg).max(axis=2)
+        strokes = _strokes_from_diff(diff, region > 0, floor=max(8.0, 5.0 + 4.0 * sigma))
+        if strokes is None:
+            continue
+
+        # ink colour of the line itself and the background right around it
+        lx0, lx1 = int(np.floor(x0)) - ox0, int(np.ceil(x1)) - ox0
+        own = np.zeros_like(strokes)
+        own[:, max(0, lx0):max(0, lx1)] = strokes[:, max(0, lx0):max(0, lx1)]
+        if int((own > 0).sum()) < 20:
+            continue
+        ink = np.median(roi[own > 0], axis=0)
+        near = cv2.dilate(strokes, np.ones((5, 5), np.uint8)) == 0
+        near &= region > 0
+        if int(near.sum()) < 30:
+            continue
+        contrast = float(np.abs(ink - np.median(roi[near], axis=0)).max())
+        if contrast < 24.0:
+            continue
+
+        wing = strokes.copy()
+        wing[:, max(0, lx0):max(0, lx1)] = 0            # the line itself is handled by its own box
+        for ex0, ey0, ex1, ey1 in rects:                  # ... and so is every other box
+            if ex1 > ox0 and ex0 < ox1 and ey1 > oy0 and ey0 < oy1:
+                wing[max(0, int(ey0) - oy0):max(0, int(np.ceil(ey1)) - oy0),
+                     max(0, int(ex0) - ox0):max(0, int(np.ceil(ex1)) - ox0)] = 0
+        if not wing.any():
+            continue
+
+        k = max(3, int(round(0.12 * bh)) | 1)
+        n, lab, _stats, _c = cv2.connectedComponentsWithStats(
+            cv2.dilate(wing, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))), connectivity=8)
+        cands = []
+        for j in range(1, n):
+            ys, xs = np.nonzero((lab == j) & (wing > 0))
+            if xs.size < 6:
+                continue
+            ix0, ix1 = int(xs.min()), int(xs.max()) + 1
+            iy0, iy1 = int(ys.min()), int(ys.max()) + 1
+            w_, h_ = ix1 - ix0, iy1 - iy0
+            if not (0.12 * bh <= h_ <= 0.8 * bh and 0.08 * bh <= w_ <= 1.2 * bh):
+                continue                                  # not glyph-sized (specks, icons, objects)
+            top, bot = oy0 + iy0, oy0 + iy1
+            if min(bot, y1) - max(top, y0) < 0.6 * h_:
+                continue                                  # not sitting on the line
+            if xs.size / float(w_ * h_) > 0.8 and min(w_, h_) > 0.5 * bh:
+                continue                                  # a solid blob, not a glyph
+            if float(np.abs(np.median(roi[ys, xs], axis=0) - ink).max()) > 0.5 * contrast:
+                continue                                  # a different colour than the text
+            cands.append((ox0 + ix0, top, ox0 + ix1, bot))
+
+        for side in (-1, 1):
+            edge = x0 if side < 0 else x1
+            taken = 0
+            pool = [c for c in cands if (c[2] <= x0 + 1 if side < 0 else c[0] >= x1 - 1)]
+            while pool and taken < _SIDE_MAX:
+                nxt = min(pool, key=(lambda c: edge - c[2]) if side < 0 else (lambda c: c[0] - edge))
+                pool.remove(nxt)
+                gap = (edge - nxt[2]) if side < 0 else (nxt[0] - edge)
+                if gap > _SIDE_GAP * bh:
+                    break
+                g = 0.25 * bh
+                fx0, fx1 = max(bx0, nxt[0] - g), min(bx1 - 1, nxt[2] + g)
+                fy0, fy1 = max(by0, min(nxt[1] - g, y0)), min(by1 - 1, max(nxt[3] + g, y1))
+                poly = np.array([[fx0, fy0], [fx1, fy0], [fx1, fy1], [fx0, fy1]], np.float32)
+                found.append(TextBox(poly, b.score))
+                rects.append([fx0, fy0, fx1, fy1])
+                edge = nxt[0] if side < 0 else nxt[2]
+                taken += 1
+    return found
+
+
 # ------------------------------------------------------------------------ clustering
 
 def _rect_union(a: Rect, b: Rect) -> Rect:
@@ -311,7 +439,12 @@ class TextEraser:
                opts: Optional[EraseOptions] = None,
                cancel: Optional[Callable[[], bool]] = None) -> list[TextBox]:
         opts = opts or EraseOptions()
-        return self.ensure_detector().detect(rgba, box_thresh=opts.box_thresh, region=region, cancel=cancel)
+        boxes = self.ensure_detector().detect(rgba, box_thresh=opts.box_thresh, region=region, cancel=cancel)
+        if opts.side_glyphs and boxes and not (cancel is not None and cancel()):
+            extra = glyphs_beside_lines(rgba, boxes, opts.box_thresh, region)
+            if extra:
+                boxes = sorted(list(boxes) + extra, key=lambda b: (round(b.xyxy()[1] / 12.0), b.xyxy()[0]))
+        return boxes
 
     def erase(self, rgba: np.ndarray, *, boxes: Optional[Sequence[TextBox]] = None,
               region: Optional[Rect] = None, opts: Optional[EraseOptions] = None,

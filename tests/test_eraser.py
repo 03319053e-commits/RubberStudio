@@ -1,7 +1,8 @@
 import numpy as np
+import pytest
 
 from conftest import gradient_bg, with_text
-from rubberstudio.core.eraser import EraseOptions, TextEraser, rel_to_px, build_stroke_mask
+from rubberstudio.core.eraser import EraseOptions, TextEraser, glyphs_beside_lines, rel_to_px, build_stroke_mask
 
 
 def rgba(a):
@@ -69,10 +70,17 @@ def test_tall_long_image_is_tiled(detector):
 
 # ---------------------------------------------------------------- regressions: heavy type, tiny neighbours
 
-def test_demo_scene_is_fully_cleaned(detector):
-    """Heavy display type on a flat banner, a caption on the sky and a '©' hugging a watermark: nothing may stay."""
+@pytest.mark.parametrize("basic_layout", [True, False], ids=["basic-layout", "raqm-layout"])
+def test_demo_scene_is_fully_cleaned(detector, basic_layout):
+    """Heavy display type on a flat banner, a caption on the sky and a '©' hugging a watermark: nothing may stay.
+
+    Pillow lays text out differently with and without Raqm (Windows builds usually lack it); with the basic layout the
+    detector has *no* response at all for the "©", so it must be picked up beside the line instead."""
+    from PIL import features
     from rubberstudio.demo import make_demo_image
-    demo = make_demo_image()
+    if not basic_layout and not features.check("raqm"):
+        pytest.skip("this Pillow build has no Raqm layout engine")
+    demo = make_demo_image(basic_layout=basic_layout)
     res = TextEraser(detector).erase(demo.copy())
     out = res.image[..., :3].astype(int)
     # banner interior is banner-red again (the glyphs were cream; a leftover speck would be spread by the fill)
@@ -157,3 +165,120 @@ def test_model_path_with_non_ascii_characters(tmp_path, clean_and_text):
     shutil.copyfile(resource_path("rubberstudio", "core", "models", MODEL_NAME), target)
     _, texty = clean_and_text
     assert len(TextDetector(target).detect(texty)) >= 3
+
+
+# ------------------------------------------------------ symbols the detector does not see (©, •, @ ...)
+
+def test_side_glyph_step_can_be_switched_off(detector):
+    from rubberstudio.demo import make_demo_image
+    demo = make_demo_image()
+    on = TextEraser(detector).detect(demo, opts=EraseOptions())
+    off = TextEraser(detector).detect(demo, opts=EraseOptions(side_glyphs=False))
+    assert len(on) == len(off) + 1, "the '©' in front of the watermark is only found by the side-glyph step"
+
+
+def _spacemono(size):
+    from PIL import ImageFont
+    from rubberstudio.core.paths import resource_path
+    return ImageFont.truetype(str(resource_path("assets", "fonts", "SpaceMono-Bold.ttf")), size,
+                              layout_engine=ImageFont.Layout.BASIC)
+
+
+def _line_scene(*, where="left", gap=12, ink=(255, 255, 255), symbol_ink=None, symbol="©", symbol_size=32,
+                dy=0, noise=2.0, bg=(40, 110, 90), draw_symbol=True, shape=None, shape_size=44):
+    """A text line on a smooth background with one stray symbol (or ``shape``: "ring" / "square") beside it
+    -> (rgb, line box, symbol bbox)."""
+    from PIL import Image, ImageDraw
+    from rubberstudio.core.textdet import TextBox
+    w, h = 760, 260
+    yy, xx = np.mgrid[0:h, 0:w]
+    base = np.stack([bg[0] + 14 * xx / w, bg[1] + 10 * yy / h, bg[2] - 12 * xx / w], -1)
+    base = base + np.random.default_rng(3).normal(0, noise, base.shape)
+    im = Image.fromarray(np.clip(base, 0, 255).astype(np.uint8))
+    d = ImageDraw.Draw(im)
+    text, base_y, lx = "Sample Studio 2026", 150, 250
+    d.text((lx, base_y), text, font=_spacemono(32), fill=ink, anchor="ls")
+    l, t, r, b = d.textbbox((lx, base_y), text, font=_spacemono(32), anchor="ls")
+    pad = 8
+    line = TextBox(np.array([[l - pad, t - pad], [r + pad, t - pad], [r + pad, b + pad], [l - pad, b + pad]],
+                            np.float32), 0.9)
+    if shape:                                    # an object, not a glyph: centred on the line, drawn with primitives
+        cy = (t + b) // 2 + dy
+        half = shape_size // 2
+        sx0 = (l - pad - gap - shape_size) if where == "left" else (r + pad + gap)
+        sym = (sx0, cy - half, sx0 + shape_size, cy + half)
+        if draw_symbol and shape == "ring":
+            d.ellipse(sym, outline=symbol_ink or ink, width=4)
+        elif draw_symbol:
+            d.rectangle(sym, fill=symbol_ink or ink)
+        return np.asarray(im), line, sym
+    sf = _spacemono(symbol_size)
+    sl, _, sr, _ = d.textbbox((0, base_y), symbol, font=sf, anchor="ls")
+    sx = (l - pad - gap - sr) if where == "left" else (r + pad + gap - sl)
+    sym = d.textbbox((sx, base_y + dy), symbol, font=sf, anchor="ls")
+    if draw_symbol:
+        d.text((sx, base_y + dy), symbol, font=sf, fill=symbol_ink or ink, anchor="ls")
+    return np.asarray(im), line, tuple(int(v) for v in sym)
+
+
+@pytest.mark.parametrize("where, symbol", [("left", "©"), ("right", "®"), ("left", "•"), ("right", "@")])
+def test_symbol_beside_a_line_is_taken_and_erased(where, symbol):
+    rgb, line, sym = _line_scene(where=where, symbol=symbol)
+    found = glyphs_beside_lines(rgb, [line], 0.5)
+    assert len(found) == 1, found
+    x0, y0, x1, y1 = found[0].xyxy()
+    assert x0 <= sym[0] and x1 >= sym[2] and y0 <= sym[1] and y1 >= sym[3], ((x0, y0, x1, y1), sym)
+    out = TextEraser().erase(np.dstack([rgb, np.full(rgb.shape[:2], 255, np.uint8)]),
+                             boxes=[line] + found).image[..., :3]
+    assert out[sym[1]:sym[3], sym[0]:sym[2]].max() <= 150, "the symbol must be gone"
+
+
+def test_symbol_chain_hangs_on_the_line():
+    """"© •" — the second symbol is within reach of the first one, not of the line."""
+    from PIL import Image, ImageDraw
+    rgb, line, sym = _line_scene(where="left", gap=10, symbol="•")
+    im = Image.fromarray(rgb)
+    d = ImageDraw.Draw(im)
+    f = _spacemono(32)
+    x = sym[0] - 12 - (sym[2] - sym[0])
+    d.text((x, 150), "•", font=f, fill=(255, 255, 255), anchor="ls")
+    found = glyphs_beside_lines(np.asarray(im), [line], 0.5)
+    assert len(found) == 2
+
+
+@pytest.mark.parametrize("case, kwargs", [
+    ("too far away (inside the search window, beyond the allowed gap)", dict(gap=62)),
+    ("far outside the search window", dict(gap=140)),
+    ("another colour", dict(symbol_ink=(255, 60, 60))),
+    ("giant glyph", dict(symbol_size=96)),
+    ("ring bigger than a glyph, fully on the line", dict(shape="ring", shape_size=44)),
+    ("solid square, glyph-sized but not glyph-shaped", dict(shape="square", shape_size=30)),
+    ("not on the line", dict(dy=-95)),
+    ("half above the line", dict(dy=-30)),
+])
+def test_things_that_are_not_part_of_the_line_are_left_alone(case, kwargs):
+    rgb, line, _sym = _line_scene(**kwargs)
+    assert glyphs_beside_lines(rgb, [line], 0.5) == [], case
+
+
+def test_side_glyph_guards():
+    rgb, line, sym = _line_scene()
+    from rubberstudio.core.textdet import TextBox
+    assert len(glyphs_beside_lines(rgb, [line], 0.5)) == 1
+    weak = TextBox(line.poly, 0.3)                                   # only confident lines are anchors
+    assert glyphs_beside_lines(rgb, [weak], 0.5) == []
+    h, w = rgb.shape[:2]
+    assert glyphs_beside_lines(rgb, [line], 0.5, bounds=(sym[2] + 4, 0, w, h)) == []        # outside the search area
+    cover = TextBox(np.array([[sym[0] - 4, sym[1] - 4], [sym[2] + 4, sym[1] - 4], [sym[2] + 4, sym[3] + 4],
+                              [sym[0] - 4, sym[3] + 4]], np.float32), 0.9)
+    assert glyphs_beside_lines(rgb, [line, cover], 0.5) == []        # another box already owns it
+    plain, line2, _ = _line_scene(draw_symbol=False)
+    assert glyphs_beside_lines(plain, [line2], 0.5) == []            # nothing there, nothing invented
+    faint, line3, _ = _line_scene(ink=(60, 125, 105))
+    assert glyphs_beside_lines(faint, [line3], 0.5) == []            # a line barely above the background: no analysis
+
+
+@pytest.mark.parametrize("ink, noise", [((255, 255, 255), 14.0), ((25, 25, 25), 14.0), ((255, 255, 255), 30.0)])
+def test_noisy_background_does_not_grow_phantom_symbols(ink, noise):
+    rgb, line, _sym = _line_scene(ink=ink, noise=noise, draw_symbol=False, bg=(120, 130, 110))
+    assert glyphs_beside_lines(rgb, [line], 0.5) == []

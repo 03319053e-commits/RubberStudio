@@ -123,7 +123,8 @@ Tests (engine and GUI, headless): `pip install -r requirements-dev.txt && python
 
 1. **Detect** — a DBNet text detector (PP-OCRv4, ONNX Runtime, CPU) finds text lines; big pictures are processed in
    overlapping tiles at native resolution so small print is not lost; tiny glyphs next to confident text ("©", bullets,
-   dots) are recovered by hysteresis.
+   dots) are recovered by hysteresis, and symbols the network does not react to at all are picked up by looking at the
+   pixels right beside a line's ends (same ink colour, glyph-sized, on flat or smoothly shaded backgrounds only).
 2. **Strokes only** — inside each box the background is modelled (a fitted plane on the box margin for flat or smooth
    surfaces, a local median otherwise) and the pixels that differ from it become the stroke mask, grown a little and
    closed so no speck of the glyph colour is left to be smeared by the fill.
