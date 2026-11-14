@@ -1,0 +1,4 @@
+# Tests and Windows packaging
+pytest>=8
+onnx>=1.16          # only used by the tests to build a tiny dummy model
+pyinstaller>=6.6

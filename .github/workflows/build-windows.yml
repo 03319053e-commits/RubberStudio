@@ -1,0 +1,115 @@
+name: Build Windows app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write            # the release step below uploads the zip when a v* tag is pushed
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+          python -m pip freeze > requirements-lock.txt
+
+      - name: Run tests
+        # Informational: the gate for shipping is the self-test of the *built* program below, which exercises the
+        # same engine, batch runner and GUI inside the real executable.
+        continue-on-error: true
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q
+
+      - name: Read version
+        id: ver
+        shell: pwsh
+        run: |
+          $v = python -c "from rubberstudio import __version__; print(__version__)"
+          "version=$v" >> $env:GITHUB_OUTPUT
+
+      - name: Build with PyInstaller
+        run: python -m PyInstaller packaging/RubberStudio.spec --noconfirm --clean
+
+      - name: Smoke-test the built program
+        shell: pwsh
+        run: |
+          $exe = Join-Path $PWD "dist\RubberStudio\RubberStudio.exe"
+          if (-not (Test-Path $exe)) { throw "build produced no exe" }
+          New-Item -ItemType Directory -Force -Path shots | Out-Null
+          $env:RUBBERSTUDIO_HOME = Join-Path $env:RUNNER_TEMP "rubberstudio-home"
+
+          function Run-App([string[]]$AppArgs) {
+            $p = Start-Process -FilePath $exe -ArgumentList $AppArgs -PassThru
+            $null = $p.Handle                       # keeps ExitCode readable after the process ends
+            if (-not $p.WaitForExit(600000)) { $p.Kill(); throw "timed out: $AppArgs" }
+            return $p.ExitCode
+          }
+
+          $report = Join-Path $PWD "shots\selftest.json"
+          $code = Run-App @("--selftest", "`"$report`"")
+          if (Test-Path $report) { Get-Content $report }
+          if ($code -ne 0) {
+            $log = Join-Path $env:RUBBERSTUDIO_HOME "logs\rubberstudio.log"
+            if (Test-Path $log) { Get-Content $log -Tail 80 }
+            throw "selftest failed (exit code $code)"
+          }
+
+          # Screenshots of the real Windows build (uploaded as an artifact); a failure here only warns.
+          foreach ($tool in @("erase", "batch", "repair")) {
+            $png = Join-Path $PWD "shots\win-$tool.png"
+            try {
+              $code = Run-App @("--screenshot", "`"$png`"", "--tool", $tool, "--lang", "en")
+              if ($code -ne 0 -or -not (Test-Path $png)) { Write-Warning "screenshot '$tool' failed (exit code $code)" }
+            } catch { Write-Warning "screenshot '$tool' failed: $_" }
+          }
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "RubberStudio-${{ steps.ver.outputs.version }}-windows-x64"
+          Compress-Archive -Path "dist\RubberStudio" -DestinationPath "$name.zip" -CompressionLevel Optimal
+          Get-Item "$name.zip" | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RubberStudio-windows-x64
+          path: RubberStudio-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-screenshots-and-selftest
+          path: |
+            shots/
+            requirements-lock.txt
+          retention-days: 30
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: RubberStudio-*-windows-x64.zip
+          generate_release_notes: true

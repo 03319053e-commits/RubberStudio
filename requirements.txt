@@ -1,0 +1,6 @@
+# Runtime dependencies (tested with: PySide6-Essentials 6.12, numpy 2.5, opencv 5.0, onnxruntime 1.32, Pillow 13)
+PySide6-Essentials>=6.7,<7
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<6
+onnxruntime>=1.17,<2
+Pillow>=10.0,<14
