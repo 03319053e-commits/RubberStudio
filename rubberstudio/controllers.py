@@ -12,7 +12,7 @@ from PySide6.QtGui import QImage
 from .core.batch import BatchItem, BatchRunner, BatchSettings, BatchSummary, Status, make_items
 from .core.eraser import EraseOptions, RelRect
 from .core.imageio import iter_images, is_supported
-from .core.neural import DEFAULT_URLS, ModelError, ModelManager
+from .core.neural import ModelError, ModelManager
 from .dispatch import Dispatcher
 
 THUMB = 168
@@ -21,7 +21,9 @@ THUMB = 168
 # ====================================================================== AI model file
 
 class ModelController(QObject):
-    """Wraps :class:`ModelManager` so that download / import / validation never block the GUI."""
+    """Wraps :class:`ModelManager` so that download / import / validation never block the GUI.
+
+    One file operation runs at a time (``busy``); the state of each model is asked by name (``lama`` | ``migan``)."""
     changed = Signal()                  # state or progress changed
     failed = Signal(str)
 
@@ -29,24 +31,27 @@ class ModelController(QObject):
         super().__init__(parent)
         self.manager = manager
         self.busy = ""                  # "" | "download" | "import"
+        self.busy_model = ""            # which model the running operation is about ("" while importing: slot unknown)
         self.progress = 0.0
         self.host = ""
         self._cancel = threading.Event()
         self._disp = Dispatcher()
 
-    @property
-    def state(self) -> str:
-        if self.busy:
-            return "downloading" if self.busy == "download" else "importing"
-        return "ready" if self.manager.is_ready() else "missing"
+    def state(self, model: str = "lama") -> str:
+        """``ready`` | ``missing`` | ``downloading`` | ``importing``."""
+        if self.busy == "import":
+            return "importing"
+        if self.busy == "download" and self.busy_model == model:
+            return "downloading"
+        return "ready" if self.manager.is_ready(model) else "missing"
 
-    def size_mb(self) -> float:
-        return self.manager.status().size_mb
+    def size_mb(self, model: str = "lama") -> float:
+        return self.manager.status(model).size_mb
 
-    def _run(self, kind: str, work: Callable[[], None]) -> None:
+    def _run(self, kind: str, model: str, work: Callable[[], None]) -> None:
         if self.busy:
             return
-        self.busy, self.progress, self.host = kind, 0.0, ""
+        self.busy, self.busy_model, self.progress, self.host = kind, model, 0.0, ""
         self._cancel.clear()
         self.changed.emit()
 
@@ -60,7 +65,7 @@ class ModelController(QObject):
                 err = f"{type(exc).__name__}: {exc}"
 
             def done() -> None:
-                self.busy = ""
+                self.busy = self.busy_model = ""
                 self.changed.emit()
                 if err:
                     self.failed.emit(err)
@@ -69,25 +74,25 @@ class ModelController(QObject):
 
         threading.Thread(target=job, daemon=True, name=f"model-{kind}").start()
 
-    def download(self, urls: Sequence[str] = DEFAULT_URLS) -> None:
+    def download(self, model: str = "lama", urls: Optional[Sequence[str]] = None) -> None:
         def prog(v: float, host: str) -> None:
             def ui() -> None:
                 self.progress, self.host = v, host
                 self.changed.emit()
             self._disp.post(ui)
 
-        self._run("download", lambda: self.manager.download(urls, prog, self._cancel))
+        self._run("download", model, lambda: self.manager.download(urls, prog, self._cancel, model=model))
 
-    def import_file(self, path: str) -> None:
-        self._run("import", lambda: self.manager.import_file(Path(path)))
+    def import_file(self, path: str, model: Optional[str] = None) -> None:
+        self._run("import", model or "", lambda: self.manager.import_file(Path(path), model))
 
     def cancel(self) -> None:
         self._cancel.set()
 
-    def remove(self) -> None:
+    def remove(self, model: str = "lama") -> None:
         if self.busy:
             return
-        self.manager.remove()
+        self.manager.remove(model)
         self.changed.emit()
 
 
@@ -270,7 +275,7 @@ class BatchController(QObject):
         self._runner: Optional[BatchRunner] = None
         self._disp = Dispatcher()
 
-    def start(self, erase: EraseOptions, region: Optional[RelRect], *, use_ai: bool) -> bool:
+    def start(self, erase: EraseOptions, region: Optional[RelRect]) -> bool:
         if self.running:
             return False
         if not self.model.pending():
@@ -295,7 +300,7 @@ class BatchController(QObject):
             self._disp.post(lambda: (self.model.touched(item), self.progress.emit(done, total)))
 
         def job() -> None:
-            neural = mgr.inpainter() if (use_ai and mgr.is_ready()) else None
+            neural, _note = mgr.resolve(erase.engine)
             runner = BatchRunner(run_items, s, neural=neural)
             self._runner = runner
             try:

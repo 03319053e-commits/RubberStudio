@@ -21,12 +21,14 @@ from rubberstudio.widgets.envelope import TAB
 
 
 def wait_until(cond, timeout=90.0, step=20):
+    """Poll ``cond`` while the Qt event loop runs. (time.sleep, not QTest.qWait: qWait keeps the GIL while it waits,
+    which starves the worker threads this waits for and makes them run ~30x slower.)"""
     end = time.time() + timeout
     while time.time() < end:
         QApplication.processEvents()
         if cond():
             return True
-        QTest.qWait(step)
+        time.sleep(step / 1000.0)
     return cond()
 
 
@@ -188,7 +190,7 @@ def test_watermark_drag_and_apply(win, demo):
 def test_detect_then_erase_whole_image_with_compare(win, demo):
     ready(win, demo, Tool.ERASE)
     e = win.editor
-    e.erase.whole_image, e.erase.use_ai = True, False
+    e.erase.whole_image, e.erase.engine = True, "fast"
     e.detect_text()
     assert wait_until(lambda: not e.busy) and len(e.boxes) >= 3
     before = e.image.copy()
@@ -208,7 +210,7 @@ def test_detect_then_erase_whole_image_with_compare(win, demo):
 def test_erase_only_inside_frame(win, demo):
     ready(win, demo, Tool.ERASE)
     e = win.editor
-    e.erase.whole_image, e.erase.use_ai = False, False
+    e.erase.whole_image, e.erase.engine = False, "fast"
     e.erase_rect = (0.05, 0.25, 0.4, 0.1)                  # just the small caption (x 64‥576, y 200‥280)
     before = e.image.copy()
     e.erase_text()
@@ -247,7 +249,7 @@ def test_batch_run_from_ui(win, tmp_path, demo):
     assert win.right_env.is_open() and win.editor.image is not None
     out = tmp_path / "out"
     win.batch_ctl.settings.out_dir = out
-    win.editor.erase.use_ai = False
+    win.editor.erase.engine = "fast"
     win.start_batch()
     assert win.batch_ctl.running
     assert wait_until(lambda: not win.batch_ctl.running, 180)
@@ -270,7 +272,7 @@ def test_batch_stop_writes_nothing_for_cancelled_items(win, tmp_path, demo):
         Image.fromarray(demo[..., :3]).save(src / f"p{i}.png")
     win.open_paths([str(src)])
     win.batch_ctl.settings.out_dir = tmp_path / "out"
-    win.editor.erase.use_ai = False
+    win.editor.erase.engine = "fast"
     win.start_batch()
     QTest.qWait(300)
     win.batch_ctl.stop()
@@ -310,15 +312,16 @@ def test_model_controller_import_and_remove(win, tmp_path, monkeypatch):
     make_dummy_model(m)
     ctl = win.model_ctl
     ctl.manager.min_bytes = 100
-    assert ctl.state == "missing"
-    ctl.import_file(str(m))
-    assert wait_until(lambda: ctl.state == "ready", 30)
-    ctl.remove()
-    assert ctl.state == "missing"
+    assert ctl.state("lama") == "missing" and ctl.state("migan") == "missing"
+    ctl.import_file(str(m))                                    # float inputs: the file is recognised as LaMa
+    assert wait_until(lambda: ctl.state("lama") == "ready", 30)
+    assert ctl.state("migan") == "missing"
+    ctl.remove("lama")
+    assert ctl.state("lama") == "missing"
     bad = tmp_path / "bad.onnx"
     bad.write_bytes(b"x" * 500)
     ctl.import_file(str(bad))
-    assert wait_until(lambda: bool(shown), 30) and ctl.state == "missing"
+    assert wait_until(lambda: bool(shown), 30) and ctl.state("lama") == "missing"
     assert "not a valid ONNX model" in shown[0][1]
 
 

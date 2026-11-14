@@ -1,14 +1,13 @@
-"""Envelope-style fold / unfold: a panel folds toward its screen edge like a flap, leaving a pull-tab."""
+"""Fold / unfold: a panel folds toward its screen edge, leaving a black pull-tab."""
 from __future__ import annotations
 
 from typing import Optional
 
 from PySide6.QtCore import QEasingCurve, QPointF, QRectF, QSize, Qt, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap, QPolygonF, QTransform
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap, QPolygonF, QTransform
 from PySide6.QtWidgets import QSizePolicy, QWidget
 
 from .. import theme as T
-from .pop import dot_color, draw_dots
 
 TAB = 24          # thickness of the always-visible pull-tab strip
 
@@ -17,7 +16,7 @@ class EnvelopePanel(QWidget):
     """Wraps ``content``; ``edge`` is the screen edge the panel is hinged to (left/right/top/bottom)."""
     toggled = Signal(bool)          # True = open
 
-    def __init__(self, content: QWidget, edge: str = "left", extent: int = 300, color: str = T.YELLOW,
+    def __init__(self, content: QWidget, edge: str = "left", extent: int = 300,
                  parent: Optional[QWidget] = None, tooltip: str = ""):
         super().__init__(parent)
         assert edge in ("left", "right", "top", "bottom")
@@ -25,7 +24,6 @@ class EnvelopePanel(QWidget):
         content.setParent(self)
         self.edge = edge
         self.extent = extent
-        self.color = color
         self._p = 1.0
         self._open = True
         self._snapshot: Optional[QPixmap] = None
@@ -163,51 +161,25 @@ class EnvelopePanel(QWidget):
         else:
             e.ignore()
 
-    def _flap_path(self) -> tuple[QPainterPath, QPointF]:
-        r = self._flap_rect()
-        path = QPainterPath()
-        pad = 3.0
-        if self.edge == "left":      # base on the content edge (left of strip), apex toward the canvas
-            a, b, c = QPointF(r.left(), r.top() + pad), QPointF(r.right() - 1, r.center().y()), QPointF(r.left(), r.bottom() - pad)
-        elif self.edge == "right":
-            a, b, c = QPointF(r.right(), r.top() + pad), QPointF(r.left() + 1, r.center().y()), QPointF(r.right(), r.bottom() - pad)
-        elif self.edge == "top":
-            a, b, c = QPointF(r.left() + pad, r.top()), QPointF(r.center().x(), r.bottom() - 1), QPointF(r.right() - pad, r.top())
-        else:
-            a, b, c = QPointF(r.left() + pad, r.bottom()), QPointF(r.center().x(), r.top() + 1), QPointF(r.right() - pad, r.bottom())
-        path.moveTo(a)
-        path.lineTo(b)
-        path.lineTo(c)
-        path.closeSubpath()
-        return path, r.center()
-
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         if self._snapshot is not None and 0.001 < self._p < 0.999:
             self._paint_fold(p)
-        # --- pull-tab flap
-        path, centre = self._flap_path()
-        hover = self._hover
-        off = 2.0 if not hover else 3.0
-        p.fillPath(path.translated(off, off), QColor(T.INK))
-        p.save()
-        p.setClipPath(path)
-        p.fillRect(path.boundingRect(), QColor(self.color if not hover else T.YELLOW))
-        draw_dots(p, path.boundingRect(), dot_color(QColor(self.color)), ramp_angle=0 if not self.vertical_axis else 90,
-                  lo=0.2, hi=1.0, spacing=5)
-        p.restore()
-        pen = QPen(QColor(T.INK), 2.4)
-        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        # --- pull-tab: a black rectangle with a white chevron, red under the pointer
+        r = self._flap_rect()
+        p.fillRect(r, QColor(T.RED if self._hover else T.INK))
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        pen = QPen(QColor(T.PAPER), 2.4)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
         p.setPen(pen)
-        p.drawPath(path)
         # chevron: points where the panel will go
-        d = 4.0
+        d = 4.5
         dirs = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}[self.edge]
         sgn = 1 if self._open else -1
         vx, vy = dirs[0] * sgn, dirs[1] * sgn
-        c = centre
+        c = r.center()
         if vx:
             tip = QPointF(c.x() + vx * d * 0.5, c.y())
             p.drawPolyline(QPolygonF([QPointF(tip.x() - vx * d, tip.y() - d), tip, QPointF(tip.x() - vx * d, tip.y() + d)]))
@@ -242,12 +214,12 @@ class EnvelopePanel(QWidget):
         p.save()
         p.setTransform(tr, True)
         p.drawPixmap(0, 0, snap)
-        # fold shading: the flap darkens as it turns away
+        # the leaf darkens as it turns away
         shade = QColor(T.INK)
-        shade.setAlphaF(0.38 * (1.0 - prog))
+        shade.setAlphaF(0.30 * (1.0 - prog))
         p.fillRect(QRectF(0, 0, sw, sh), shade)
         p.restore()
-        pen = QPen(QColor(T.INK), 2.4)
-        p.setPen(pen)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setPen(QPen(QColor(T.INK), 2.0))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawPolygon(dst)

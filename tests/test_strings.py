@@ -7,9 +7,11 @@ from pathlib import Path
 from rubberstudio.strings import STRINGS
 
 ROOT = Path(__file__).resolve().parents[1] / "rubberstudio"
-KEY = re.compile(r"^(ai|bt|canvas|crop|dlg|er|file|fold|hdr|help|hist|q|rep|splash|st|tool|wm)(\.[a-z0-9_]+)+$")
+KEY = re.compile(r"^(ai|bt|canvas|crop|dlg|eng|er|file|fold|hdr|help|hist|q|rep|splash|st|tool|wm)(\.[a-z0-9_]+)+$")
 DYNAMIC = [f"help.{k}.{part}" for k in ("crop", "repair", "watermark", "erase", "batch", "keys") for part in "hb"]
 DYNAMIC += [f"rep.hint.{k}" for k in ("heal", "smudge", "texture")]
+DYNAMIC += [f"eng.hint.{k}" for k in ("auto", "fast", "migan", "lama")]
+DYNAMIC += [f"eng.{k}" for k in ("auto", "fast", "migan", "lama")]
 
 
 def _used_keys() -> set:

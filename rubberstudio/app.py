@@ -153,7 +153,7 @@ def run_selftest(report_path: Optional[str]) -> int:
         assert app is not None
         T.load_fonts()
         fams = set(QFontDatabase.families())
-        assert "Archivo Black" in fams and "Space Mono" in fams, "bundled fonts did not load"
+        assert "Liberation Sans" in fams, "bundled font did not load"
         with tempfile.TemporaryDirectory(prefix="rubberstudio-selftest-") as tmp:
             win = MainWindow(ModelManager(Path(tmp)), splash=False, restore=False)
             win.resize(1280, 800)

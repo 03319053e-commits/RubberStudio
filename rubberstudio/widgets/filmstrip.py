@@ -1,4 +1,4 @@
-"""The right-hand "film" — the batch queue drawn as strips of film with sprocket holes."""
+"""The right-hand queue — the batch list drawn as plain rows: status bar, thumbnail, name, status, detail."""
 from __future__ import annotations
 
 import subprocess
@@ -6,10 +6,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import QModelIndex, QPoint, QPointF, QRectF, QSize, Qt, QUrl, Signal
+from PySide6.QtCore import QModelIndex, QPoint, QRectF, QSize, Qt, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFontMetrics, QKeyEvent, QPainter, QPen
-from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QListView, QMenu, QSizePolicy, QStackedLayout,
-                               QStyle, QStyledItemDelegate, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QHBoxLayout, QListView, QMenu, QStackedLayout, QStyle,
+                               QStyledItemDelegate, QVBoxLayout, QWidget)
 
 from .. import theme as T
 from ..controllers import BatchController, BatchModel, ItemRole, ThumbRole
@@ -17,18 +17,19 @@ from ..core.batch import BatchItem, Status
 from ..i18n import tr
 from .icons import draw_icon
 from .panels import PaperPane
-from .pop import Chip, PopButton, SectionLabel, draw_dots, draw_pop_box, dot_color
+from .pop import Chip, PopButton, SectionLabel, draw_box
 
 ROW_H = 94
 
-STATUS_LOOK = {                       # status -> (translation key, chip colour, shadow colour)
-    Status.QUEUED: ("q.st.queued", T.PAPER_HI, T.INK_FAINT),
-    Status.RUNNING: ("q.st.running", T.YELLOW, T.YELLOW),
-    Status.DONE: ("q.st.done", T.GREEN, T.GREEN),
-    Status.NO_TEXT: ("q.st.no_text", T.PINK, T.PINK),
-    Status.FAILED: ("q.st.failed", T.RED, T.RED),
-    Status.CANCELED: ("q.st.canceled", T.PAPER_LO, T.INK_FAINT),
+STATUS_LOOK = {                       # status -> (translation key, chip tone)
+    Status.QUEUED: ("q.st.queued", "paper"),
+    Status.RUNNING: ("q.st.running", "red"),
+    Status.DONE: ("q.st.done", "ink"),
+    Status.NO_TEXT: ("q.st.no_text", "paper"),
+    Status.FAILED: ("q.st.failed", "red"),
+    Status.CANCELED: ("q.st.canceled", "paper"),
 }
+_BAR = {"red": T.RED, "ink": T.INK, "paper": T.INK_FAINT}       # colour of the status bar at the row's left edge
 
 
 class FilmDelegate(QStyledItemDelegate):
@@ -40,30 +41,17 @@ class FilmDelegate(QStyledItemDelegate):
         if item is None:
             return
         p.save()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-        key, chip_col, shadow_col = STATUS_LOOK[item.status]
+        key, tone = STATUS_LOOK[item.status]
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hover = bool(option.state & QStyle.StateFlag.State_MouseOver)
-        r = QRectF(option.rect).adjusted(5, 4, -9, -8)
-        if hover and not selected:
-            r.translate(-1, -1)
-        strip = draw_pop_box(p, r, fill=T.INK, radius=8, shadow=4 if not selected else 5, shadow_color=shadow_col,
-                             border=2.5, border_color=T.INK)
-        # sprocket holes
-        hole = QColor(T.PAPER)
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(hole)
-        y = strip.top() + 8
-        while y + 10 < strip.bottom() - 3:
-            p.drawRoundedRect(QRectF(strip.left() + 6, y, 8, 10), 2, 2)
-            p.drawRoundedRect(QRectF(strip.right() - 14, y, 8, 10), 2, 2)
-            y += 15
-        frame = QRectF(strip.left() + 20, strip.top() + 6, strip.width() - 40, strip.height() - 12)
-        draw_pop_box(p, frame, fill=T.PAPER_HI, radius=4, shadow=0, border=1.6, border_color=T.PAPER_LO)
+        r = QRectF(option.rect).adjusted(2, 3, -8, -3)
+        inner = draw_box(p, r, fill=T.PAPER_LO if hover and not selected else T.PAPER_HI, border=3 if selected else 2,
+                         border_color=T.RED if selected else T.INK)
+        p.fillRect(QRectF(inner.left(), inner.top(), 6, inner.height()), QColor(_BAR[tone]))
 
         # thumbnail
-        th = QRectF(frame.left() + 5, frame.top() + 5, 76, frame.height() - 10)
+        th = QRectF(inner.left() + 14, inner.top() + 8, 68, inner.height() - 16)
         p.fillRect(th, QColor(T.PAPER_LO))
         img = index.data(ThumbRole)
         if img is not None and not img.isNull():
@@ -71,31 +59,29 @@ class FilmDelegate(QStyledItemDelegate):
             w, h = img.width() * s, img.height() * s
             tr_ = QRectF(th.center().x() - w / 2, th.center().y() - h / 2, w, h)
             p.drawImage(tr_, img)
-            p.setPen(QPen(QColor(T.INK), 1.6))
+            p.setPen(QPen(QColor(T.INK), 1.0))
             p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(tr_)
+            p.drawRect(tr_.adjusted(0.5, 0.5, -0.5, -0.5))
         else:
-            draw_icon(p, "photo", th.adjusted(20, 14, -20, -14), QColor(T.INK_FAINT), 1.6)
-            p.setPen(QPen(QColor(T.INK), 1.6))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRect(th)
+            draw_icon(p, "photo", th.adjusted(18, 14, -18, -14), QColor(T.INK_FAINT), 1.6)
 
         # text
-        tx = th.right() + 9
-        tw = frame.right() - 6 - tx
-        p.setFont(T.font_mono(10.5, True, 0.2))
+        tx = th.right() + 12
+        tw = inner.right() - 8 - tx
+        f = T.font_ui(11.5, True)
+        p.setFont(f)
         p.setPen(QColor(T.INK))
-        name = QFontMetrics(p.font()).elidedText(item.src.name, Qt.TextElideMode.ElideMiddle, int(tw))
-        p.drawText(QRectF(tx, frame.top() + 5, tw, 18), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
+        name = QFontMetrics(f).elidedText(item.src.name, Qt.TextElideMode.ElideMiddle, int(tw))
+        p.drawText(QRectF(tx, inner.top() + 7, tw, 18), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, name)
 
         label = tr(key)
-        pf = T.font_mono(9.5, True)
-        p.setFont(pf)
+        pf = T.font_label(9, True, 0.8)
         cw = QFontMetrics(pf).horizontalAdvance(label) + 16
-        chip = QRectF(tx, frame.top() + 28, cw, 19)
-        draw_pop_box(p, chip, fill=chip_col, radius=9.5, shadow=0, border=1.8, dots=item.status != Status.QUEUED,
-                     dots_hi=0.8, ramp_angle=30)
-        p.setPen(QColor(T.TEXT_ON.get(chip_col, T.INK)))
+        chip = QRectF(tx, inner.top() + 30, min(cw, tw), 18)
+        fill, text, edge = Chip.TONES[tone]
+        draw_box(p, chip, fill=fill, border=1.5, border_color=edge)
+        p.setFont(pf)
+        p.setPen(QColor(text))
         p.drawText(chip, Qt.AlignmentFlag.AlignCenter, label)
 
         detail = ""
@@ -106,40 +92,36 @@ class FilmDelegate(QStyledItemDelegate):
         elif item.status == Status.RUNNING:
             detail = tr("q.working")
         if detail:
-            f = T.font_ui(10)
+            f = T.font_ui(10.5)
             p.setFont(f)
             p.setPen(QColor(T.INK_SOFT))
-            p.drawText(QRectF(tx, frame.top() + 50, tw, 16), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            p.drawText(QRectF(tx, inner.top() + 52, tw, 16), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        QFontMetrics(f).elidedText(detail, Qt.TextElideMode.ElideRight, int(tw)))
-        if selected:
-            p.setPen(QPen(QColor(T.YELLOW), 3.0))
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(r.adjusted(-2.5, -2.5, 2.5, 2.5), 10, 10)
         p.restore()
 
 
 class _Empty(QWidget):
-    """Dashed "drop here" box shown while the film is empty."""
+    """Dashed "drop here" box shown while the queue is empty."""
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         box = QRectF(6, 6, self.width() - 16, min(self.height() - 16, 230))
-        pen = QPen(QColor(T.INK_SOFT), 2.4, Qt.PenStyle.CustomDashLine)
-        pen.setDashPattern([4, 4])
+        pen = QPen(QColor(T.INK), 1.5, Qt.PenStyle.CustomDashLine)
+        pen.setDashPattern([4, 3])
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(box, 14, 14)
-        ic = QRectF(0, 0, 64, 64)
-        ic.moveCenter(QPointF(box.center().x(), box.center().y() - 36))
-        draw_pop_box(p, ic, fill=T.BLUE, radius=14, shadow=4, border=2.8, misreg=2, dots=True, dots_hi=0.9)
-        draw_icon(p, "batch", ic.adjusted(13, 13, -13, -13), QColor(T.PAPER_HI), 2.2)
+        p.drawRect(box)
+        ic = QRectF(0, 0, 56, 56)
+        ic.moveCenter(box.center())
+        ic.moveTop(box.top() + 28)
+        p.fillRect(ic, QColor(T.INK))
+        draw_icon(p, "batch", ic.adjusted(12, 12, -12, -12), QColor(T.PAPER), 2.0)
         p.setPen(QColor(T.INK))
-        p.setFont(T.font_mono(12, True, 1.0))
-        p.drawText(QRectF(box.left(), box.center().y() + 8, box.width(), 24), Qt.AlignmentFlag.AlignHCenter, tr("q.empty.title"))
+        p.setFont(T.font_label(11.5, True, 1.2))
+        p.drawText(QRectF(box.left(), ic.bottom() + 14, box.width(), 22), Qt.AlignmentFlag.AlignHCenter, tr("q.empty.title"))
         p.setPen(QColor(T.INK_SOFT))
         p.setFont(T.font_ui(11.5))
-        p.drawText(QRectF(box.left() + 16, box.center().y() + 36, box.width() - 32, 70),
+        p.drawText(QRectF(box.left() + 16, ic.bottom() + 40, box.width() - 32, 70),
                    Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap, tr("q.empty.sub"))
 
 
@@ -161,7 +143,7 @@ class QueuePanel(PaperPane):
     openRequested = Signal(str)
 
     def __init__(self, model: BatchModel, controller: BatchController, parent: Optional[QWidget] = None):
-        super().__init__("left", parent, seed=4)
+        super().__init__("left", parent)
         self.model, self.controller = model, controller
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 14, 14, 12)
@@ -169,7 +151,7 @@ class QueuePanel(PaperPane):
         head = QHBoxLayout()
         head.addWidget(SectionLabel("q.title"))
         head.addStretch(1)
-        self.count = Chip("0", T.PAPER_HI)
+        self.count = Chip("0", "paper")
         head.addWidget(self.count)
         lay.addLayout(head)
 
@@ -198,9 +180,9 @@ class QueuePanel(PaperPane):
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.btn_add = PopButton("q.add", "paper", "plus", height=36, px=10.5, shadow=3)
-        self.btn_folder = PopButton("q.folder", "paper", "folder", height=36, px=10.5, shadow=3)
-        self.btn_clear = PopButton("q.clear", "paper", "trash", height=36, px=10.5, shadow=3)
+        self.btn_add = PopButton("q.add", "paper", "plus", height=36, px=10.5)
+        self.btn_folder = PopButton("q.folder", "paper", "folder", height=36, px=10.5)
+        self.btn_clear = PopButton("q.clear", "paper", "trash", height=36, px=10.5)
         for b in (self.btn_add, self.btn_folder, self.btn_clear):
             row.addWidget(b, 1)
         lay.addLayout(row)
@@ -220,11 +202,11 @@ class QueuePanel(PaperPane):
         running = self.controller.running
         if running:
             done = c["done"] + c["no_text"] + c["failed"] + c["canceled"]
-            self.count.set_chip(f"{done}/{total}", T.YELLOW)
+            self.count.set_chip(f"{done}/{total}", "red")
         elif total:
-            self.count.set_chip(tr("q.files", n=total), T.PAPER_HI if not c["done"] else T.GREEN)
+            self.count.set_chip(tr("q.files", n=total), "paper" if not c["done"] else "ink")
         else:
-            self.count.set_chip("0", T.PAPER_HI)
+            self.count.set_chip("0", "paper")
         self.stack.setCurrentWidget(self.view if total else self.empty)
         self.btn_clear.setEnabled(total > 0 and not running)
         self.btn_add.setEnabled(not running)

@@ -18,6 +18,12 @@ from .core.imageio import ImageMeta, load_image, save_image
 from .core.neural import ModelManager
 from .core.textdet import TextBox, TextDetector
 from .dispatch import Dispatcher
+from .i18n import tr
+
+
+def engine_label(engine: str) -> str:
+    """Name of a fill engine as shown to the user (the fast fill is the only one that is translated)."""
+    return {"lama": "LaMa", "migan": "MI-GAN", "auto": "AUTO"}.get(engine) or tr("eng.fast")
 
 
 class Tool(str, Enum):
@@ -56,17 +62,22 @@ class WatermarkSettings:
     center: tuple = (0.78, 0.9)       # relative position of the label's centre
 
 
+ENGINES = ("auto", "fast", "migan", "lama")       # fill engines in the order the selector shows them
+
+
 @dataclass
 class ErasePrefs:
     whole_image: bool = False         # False: only the framed region (like the iOS app)
     sensitivity: float = 0.5          # 0..1, higher finds more (and fainter) text
     grow: float = 0.12
-    use_ai: bool = True
-    always_ai: bool = False
+    engine: str = "auto"              # auto | fast | migan | lama — see ModelManager.resolve
+    thorough: bool = True             # multi-scale detection + a check that the text is really gone (a bit slower)
 
     def options(self) -> EraseOptions:
+        eng = self.engine if self.engine in ENGINES else "auto"
         return EraseOptions(box_thresh=round(0.8 - 0.6 * float(self.sensitivity), 3), grow=float(self.grow),
-                            use_neural=self.use_ai, always_neural=self.always_ai)
+                            thorough=bool(self.thorough), verify=bool(self.thorough), engine=eng,
+                            use_neural=eng != "fast", always_neural=eng in ("migan", "lama"))
 
 
 class EditorModel(QObject):
@@ -448,8 +459,8 @@ class EditorModel(QObject):
         if self.image is None or self.busy:
             return
         arr, region, opts = self.image, self._region_px(), self.erase.options()
-        use_nn = self.erase.use_ai or self.erase.always_ai
-        neural = self.models.inpainter() if use_nn else None
+        neural, _ = self.models.resolve(self.erase.engine)
+        wanted = self.erase.engine
         self.set_status("st.detecting")
         src_version = self.version
 
@@ -477,8 +488,12 @@ class EditorModel(QObject):
             self.after = before.copy() if before is not None else None      # BEFORE view on the canvas
             self.show_after = False
             self.compareChanged.emit()
-            if res.note:
-                self.set_status("st.erased_note", ai=res.neural_count, fast=res.fast_count, note=res.note)
+            used = getattr(neural, "kind", "fast")
+            note = res.note
+            if not note and wanted in ("migan", "lama") and used != wanted:
+                note = tr("st.engine_fallback", want=engine_label(wanted), got=engine_label(used))
+            if note:
+                self.set_status("st.erased_note", ai=res.neural_count, fast=res.fast_count, note=note)
             else:
                 self.set_status("st.erased", ai=res.neural_count, fast=res.fast_count)
 

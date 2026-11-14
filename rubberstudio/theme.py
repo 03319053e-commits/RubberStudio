@@ -1,6 +1,8 @@
-"""Design tokens — the single place to retune the look (colour-clash paper / film, pop-art halftone).
+"""Design tokens — the single place to retune the look.
 
-Everything visual reads from here, so matching the 风洞 palette exactly is a matter of editing these values.
+The look follows the NASA Graphics Standards Manual of 1975 (Danne & Blackburn): a white page, black type and rules,
+exactly one red, a Helvetica-style grotesque, strict rectangles, bold tracked capitals for labels. No gradients, no
+shadows, no texture, no rounded corners. Red means "this one": the active tool, the primary action, progress.
 """
 from __future__ import annotations
 
@@ -18,39 +20,22 @@ def qc(hex_or_rgb, alpha: float = 1.0) -> QColor:
     return c
 
 
-# --- paper & ink ------------------------------------------------------------------------------
-PAPER = "#F4EEDF"        # warm cream, the page
-PAPER_HI = "#FBF7EC"     # panels / fields
-PAPER_LO = "#E7DDC6"     # the desk the picture lies on
-INK = "#1C1A17"          # outlines, text, hard shadows
-INK_SOFT = "#5A544A"     # secondary text
-INK_FAINT = "#8C8575"    # disabled / hints
+# --- black, white, one red ----------------------------------------------------------------------
+PAPER = "#FFFFFF"        # the page
+PAPER_HI = "#FFFFFF"     # panels / fields (the manual has no tinted boxes)
+PAPER_LO = "#E8E8E8"     # the desk the picture lies on, hover tint
+INK = "#000000"          # type, rules, outlines
+INK_SOFT = "#4A4A4A"     # secondary text (8.9 : 1 on white)
+INK_FAINT = "#8F8F8F"    # disabled text and rules only
+RED = "#DA291C"          # white on it: 4.9 : 1 — AA for normal text
+RED_DARK = "#A81E14"     # pressed
 
-# --- clashing process inks --------------------------------------------------------------------
-RED = "#F0452A"          # vermilion — also the eraser sleeve of the app icon
-YELLOW = "#FFC52E"
-BLUE = "#2E57E8"
-GREEN = "#22B58B"
-PINK = "#FF8DBA"
-
-# every tool owns one colour
-TOOL_COLORS = {
-    "crop": YELLOW,
-    "repair": GREEN,
-    "watermark": PINK,
-    "erase": RED,
-    "batch": BLUE,
-}
-
-BORDER = 2.5             # ink outline width
-SHADOW = 5               # hard offset shadow
-MISREG = 2               # colour layer slips this many px against the ink (print mis-registration)
-RADIUS = 11
-DOT = 7.0                # halftone pitch (px)
+BORDER = 2.0             # control outline
+RULE = 4.0               # the heavy rule above a panel title
+HAIR = 1.0               # hairline
 
 TEXT_ON = {              # readable text colour on each ink
-    PAPER: INK, PAPER_HI: INK, PAPER_LO: INK, YELLOW: INK, GREEN: INK, PINK: INK,
-    RED: INK, BLUE: PAPER_HI, INK: PAPER_HI,
+    PAPER: INK, PAPER_LO: INK, INK: PAPER, RED: PAPER, RED_DARK: PAPER,
 }
 
 
@@ -62,12 +47,11 @@ def mix(a: str, b: str, t: float) -> QColor:
                   round(ca.blue() + (cb.blue() - ca.blue()) * t))
 
 
-# --- fonts ------------------------------------------------------------------------------------
-DISPLAY_FAMILY = "Archivo Black"
-MONO_FAMILY = "Space Mono"
+# --- fonts: Liberation Sans (Arial-compatible, bundled) everywhere ---------------------------------
+SANS_FAMILY = "Liberation Sans"
 _CJK_FALLBACK = ["Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC",
                  "Source Han Sans SC", "WenQuanYi Micro Hei", "SimHei"]
-_UI_FAMILIES = ["Segoe UI", "Helvetica Neue", "Noto Sans", "DejaVu Sans", "Arial"] + _CJK_FALLBACK
+_FAMILIES = [SANS_FAMILY, "Helvetica Neue", "Helvetica", "Arial"] + _CJK_FALLBACK
 
 _loaded = False
 
@@ -76,18 +60,18 @@ def load_fonts() -> None:
     global _loaded
     if _loaded:
         return
-    for name in ("ArchivoBlack-Regular.ttf", "SpaceMono-Regular.ttf", "SpaceMono-Bold.ttf"):
+    for name in ("LiberationSans-Regular.ttf", "LiberationSans-Bold.ttf"):
         path = resource_path("assets", "fonts", name)
         if path.is_file():
             QFontDatabase.addApplicationFont(str(path))
     _loaded = True
 
 
-def _font(families: list[str], px: float, weight: QFont.Weight, spacing: float = 0.0) -> QFont:
+def _font(px: float, bold: bool, spacing: float = 0.0) -> QFont:
     f = QFont()
-    f.setFamilies(families)
+    f.setFamilies(_FAMILIES)
     f.setPixelSize(max(1, int(round(px))))
-    f.setWeight(weight)
+    f.setWeight(QFont.Weight.Bold if bold else QFont.Weight.Normal)
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     if spacing:
         f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, spacing)
@@ -96,18 +80,19 @@ def _font(families: list[str], px: float, weight: QFont.Weight, spacing: float =
 
 @lru_cache(maxsize=64)
 def font_display(px: float = 26) -> QFont:
-    return _font([DISPLAY_FAMILY] + _CJK_FALLBACK, px, QFont.Weight.Normal)
+    """Big headlines: bold, a little tight."""
+    return _font(px, True, -0.02 * px)
 
 
 @lru_cache(maxsize=64)
-def font_mono(px: float = 11, bold: bool = True, spacing: float = 0.6) -> QFont:
-    return _font([MONO_FAMILY] + _CJK_FALLBACK, px,
-                 QFont.Weight.Bold if bold else QFont.Weight.Normal, spacing)
+def font_label(px: float = 11, bold: bool = True, spacing: float = 1.0) -> QFont:
+    """Capitals with air between the letters: buttons, section labels, figures."""
+    return _font(px, bold, spacing)
 
 
 @lru_cache(maxsize=64)
 def font_ui(px: float = 12, bold: bool = False) -> QFont:
-    return _font(_UI_FAMILIES, px, QFont.Weight.DemiBold if bold else QFont.Weight.Normal)
+    return _font(px, bold)
 
 
 def _arrow_url() -> str:
@@ -119,35 +104,35 @@ def stylesheet() -> str:
     return f"""
     * {{ color: {INK}; }}
     QMainWindow, QDialog, QMessageBox {{ background: {PAPER}; }}
-    QToolTip {{ background: {INK}; color: {PAPER_HI}; border: 2px solid {INK}; padding: 5px 8px; }}
+    QToolTip {{ background: {INK}; color: {PAPER}; border: 0; padding: 5px 8px; }}
     QLineEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox, QFontComboBox {{
-        background: {PAPER_HI}; border: 2px solid {INK}; border-radius: 7px;
-        padding: 4px 8px; selection-background-color: {YELLOW}; selection-color: {INK};
-        min-height: 20px;
+        background: {PAPER_HI}; border: 2px solid {INK}; border-radius: 0;
+        padding: 3px 8px; selection-background-color: {RED}; selection-color: {PAPER};
+        min-height: 20px; placeholder-text-color: {INK_SOFT};
     }}
-    QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{ background: #FFFDF6; border-color: {BLUE}; }}
+    QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus {{ border-color: {RED}; }}
     QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {{ color: {INK_FAINT}; border-color: {INK_FAINT}; }}
     QComboBox::drop-down {{ border: none; width: 22px; }}
     QComboBox::down-arrow {{ image: url("{_arrow_url()}"); width: 14px; height: 10px; margin-right: 6px; }}
-    QComboBox QAbstractItemView {{ background: {PAPER_HI}; border: 2px solid {INK}; selection-background-color: {YELLOW};
-        selection-color: {INK}; outline: 0; padding: 2px; }}
+    QComboBox QAbstractItemView {{ background: {PAPER_HI}; border: 2px solid {INK}; selection-background-color: {INK};
+        selection-color: {PAPER}; outline: 0; padding: 0; }}
     QSpinBox::up-button, QSpinBox::down-button {{ width: 16px; border: none; background: transparent; }}
     QScrollArea {{ background: transparent; border: none; }}
     QScrollArea > QWidget > QWidget {{ background: transparent; }}
-    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-    QScrollBar::handle:vertical {{ background: {INK}; border-radius: 3px; min-height: 36px; }}
+    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 0; }}
+    QScrollBar::handle:vertical {{ background: {INK}; border-radius: 0; min-height: 36px; margin: 0 3px; }}
     QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; width: 0; }}
     QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
-    QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-    QScrollBar::handle:horizontal {{ background: {INK}; border-radius: 3px; min-width: 36px; }}
-    QMenu {{ background: {PAPER_HI}; border: 2px solid {INK}; padding: 4px; }}
-    QMenu::item {{ padding: 6px 22px; border-radius: 4px; }}
-    QMenu::item:selected {{ background: {YELLOW}; }}
-    QPushButton {{ background: {PAPER_HI}; border: 2px solid {INK}; border-radius: 8px; padding: 6px 16px; font-weight: 600; }}
-    QPushButton:hover {{ background: {YELLOW}; }}
-    QPushButton:pressed {{ background: {RED}; }}
-    QProgressBar {{ border: 2px solid {INK}; border-radius: 7px; background: {PAPER_HI}; text-align: center; height: 16px; }}
-    QProgressBar::chunk {{ background: {GREEN}; border-radius: 4px; }}
+    QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 0; }}
+    QScrollBar::handle:horizontal {{ background: {INK}; border-radius: 0; min-width: 36px; margin: 3px 0; }}
+    QMenu {{ background: {PAPER_HI}; border: 2px solid {INK}; padding: 0; }}
+    QMenu::item {{ padding: 6px 22px; }}
+    QMenu::item:selected {{ background: {INK}; color: {PAPER}; }}
+    QPushButton {{ background: {PAPER_HI}; border: 2px solid {INK}; border-radius: 0; padding: 6px 16px; font-weight: bold; }}
+    QPushButton:hover {{ background: {PAPER_LO}; }}
+    QPushButton:pressed {{ background: {INK}; color: {PAPER}; }}
+    QProgressBar {{ border: 2px solid {INK}; border-radius: 0; background: {PAPER_HI}; text-align: center; height: 16px; }}
+    QProgressBar::chunk {{ background: {RED}; }}
     QListWidget {{ background: transparent; border: none; outline: 0; }}
     """
 

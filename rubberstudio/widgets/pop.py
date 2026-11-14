@@ -1,115 +1,65 @@
-"""Pop-art / colour-clash paper widgets: hard-shadow boxes, halftone dots, mis-registered colour."""
+"""Flat widgets in the style of the 1975 NASA Graphics Standards Manual: white fields, black rules, red for the one
+active thing. Rectangles only — no radius, no shadow, no texture."""
 from __future__ import annotations
 
-import math
 from typing import Optional, Sequence
 
 from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFontMetrics, QFontMetricsF, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFontMetrics, QFontMetricsF, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QAbstractButton, QFrame, QLabel, QSizePolicy, QVBoxLayout, QWidget
 
 from .. import theme as T
 from ..i18n import Translatable, tr
 from .icons import draw_icon
-from .textures import halftone_pixmap, paper_tile, tint
 
-# variant -> (fill, text, shadow)
+# variant -> (fill, text, border, hover fill)
 VARIANTS = {
-    "paper": (T.PAPER_HI, T.INK, T.INK),
-    "ink": (T.INK, T.PAPER_HI, T.RED),
-    "red": (T.RED, T.INK, T.INK),
-    "yellow": (T.YELLOW, T.INK, T.INK),
-    "green": (T.GREEN, T.INK, T.INK),
-    "blue": (T.BLUE, T.PAPER_HI, T.INK),
-    "pink": (T.PINK, T.INK, T.INK),
+    "paper": (T.PAPER_HI, T.INK, T.INK, T.PAPER_LO),
+    "ink": (T.INK, T.PAPER, T.INK, "#2B2B2B"),
+    "red": (T.RED, T.PAPER, T.RED, T.RED_DARK),
 }
+# what a pressed / checked button turns into
+_PRESSED = {"paper": "ink", "ink": "red", "red": "ink"}
 
 
-def rrect(rect: QRectF, r: float) -> QPainterPath:
-    path = QPainterPath()
-    path.addRoundedRect(rect, r, r)
-    return path
-
-
-def _luma(c: QColor) -> float:
-    return 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
-
-
-def dot_color(fill: QColor) -> QColor:
-    """Ben-Day dots: darker than light inks, lighter than dark inks."""
-    if _luma(fill) > 150:
-        c = T.mix(fill.name(), T.INK, 0.28)
-        c.setAlphaF(0.55)
-    elif _luma(fill) > 60:
-        c = T.mix(fill.name(), "#FFFFFF", 0.42)
-        c.setAlphaF(0.5)
-    else:
-        c = QColor(T.PAPER)
-        c.setAlphaF(0.16)
-    return c
-
-
-def _q16(v: float) -> int:
-    return (int(v) // 16 + 1) * 16
-
-
-def paper_brush(base: str = T.PAPER, seed: int = 1) -> QBrush:
-    c = QColor(base)
-    return QBrush(paper_tile((c.red(), c.green(), c.blue()), seed))
-
-
-def draw_dots(p: QPainter, rect: QRectF, color: QColor, *, ramp_angle: float = 45.0, lo: float = 0.0,
-              hi: float = 0.9, spacing: float = T.DOT, speckle: float = 0.0) -> None:
-    pm = halftone_pixmap(_q16(rect.width()), _q16(rect.height()), tint(color), spacing, 45.0,
-                         ramp_angle, lo, hi, 0.62, speckle)
-    p.drawPixmap(rect.topLeft(), pm)
-
-
-def draw_pop_box(p: QPainter, rect: QRectF, *, fill: str = T.PAPER_HI, radius: float = T.RADIUS,
-                 shadow: float = T.SHADOW, shadow_color: str = T.INK, border: float = T.BORDER,
-                 misreg: float = 0.0, dots: bool = False, dots_hi: float = 0.9, dots_lo: float = 0.0,
-                 ramp_angle: float = 45.0, speckle: float = 0.0, border_color: str = T.INK) -> QRectF:
-    """Paint the signature box. ``rect`` is the outer edge of the ink outline; the shadow extends beyond it."""
+def draw_box(p: QPainter, rect: QRectF, *, fill: str = T.PAPER_HI, border: float = T.BORDER,
+             border_color: str = T.INK) -> QRectF:
+    """A plain rectangle; ``rect`` is the outer edge of the outline. Returns the area inside the outline."""
     p.save()
-    p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-    if shadow > 0:
-        p.fillPath(rrect(rect.translated(shadow, shadow), radius), QColor(shadow_color))
-    inner = rect.adjusted(border / 2, border / 2, -border / 2, -border / 2)
-    fc = QColor(fill)
-    if misreg:
-        p.fillPath(rrect(inner, radius), QColor(T.PAPER_HI))          # paper shows through the slip
-    fbox = inner.translated(misreg, misreg) if misreg else inner
-    fpath = rrect(fbox, radius)
-    p.fillPath(fpath, fc)
-    if dots:
-        p.save()
-        p.setClipPath(fpath)
-        draw_dots(p, fbox, dot_color(fc), ramp_angle=ramp_angle, lo=dots_lo, hi=dots_hi, speckle=speckle)
-        p.restore()
-    pen = QPen(QColor(border_color), border)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    p.setPen(pen)
-    p.setBrush(Qt.BrushStyle.NoBrush)
-    p.drawPath(rrect(inner, radius))
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    if border > 0:
+        p.fillRect(rect, QColor(border_color))
+    inner = rect.adjusted(border, border, -border, -border)
+    p.fillRect(inner, QColor(fill))
     p.restore()
     return inner
+
+
+def _focus_ring(p: QPainter, rect: QRectF, color: str, inset: float = 4.0) -> None:
+    """Dashed keyboard-focus rectangle, ``inset`` px inside ``rect``."""
+    pen = QPen(QColor(color), 1.0, Qt.PenStyle.DashLine)
+    p.save()
+    p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawRect(rect.adjusted(inset, inset, -inset - 0.5, -inset - 0.5))
+    p.restore()
 
 
 # ====================================================================== buttons
 
 class PopButton(QAbstractButton, Translatable):
-    """Flat colour block with ink outline and a hard shadow; presses *into* the shadow."""
+    """Outlined rectangle with a bold capital label; inverts while pressed."""
 
     def __init__(self, key: str = "", variant: str = "paper", icon: Optional[str] = None,
                  parent: Optional[QWidget] = None, *, text: Optional[str] = None, height: int = 36,
-                 shadow: int = 4, px: float = 12, checked_variant: Optional[str] = None):
+                 px: float = 11.5, checked_variant: Optional[str] = None):
         super().__init__(parent)
         self.init_key(key)
         self._literal = text
         self.variant = variant
-        self.checked_variant = checked_variant or variant
+        self.checked_variant = checked_variant
         self.icon_name = icon
-        self._shadow = shadow
         self._px = px
         self._hover = False
         self.setFixedHeight(height)
@@ -128,8 +78,8 @@ class PopButton(QAbstractButton, Translatable):
         self.update()
 
     def sizeHint(self) -> QSize:
-        fm = QFontMetrics(T.font_mono(self._px, True))
-        w = fm.horizontalAdvance(self.text()) + 30 + self._shadow + (24 if self.icon_name else 0)
+        fm = QFontMetrics(T.font_label(self._px, True))
+        w = fm.horizontalAdvance(self.text()) + 30 + (24 if self.icon_name else 0)
         return QSize(max(w, 44), self.height())
 
     def minimumSizeHint(self) -> QSize:          # lets a row of buttons shrink; the label is elided when it no longer fits
@@ -143,38 +93,36 @@ class PopButton(QAbstractButton, Translatable):
         self._hover = False
         self.update()
 
-    def _look(self):
-        v = self.checked_variant if self.isChecked() else self.variant
-        if self.isCheckable() and not self.isChecked():
-            v = self.variant
-        return VARIANTS.get(v, VARIANTS["paper"])
+    def _look(self) -> tuple[str, str, str, int]:
+        """(fill, text, border, border width) for the current state."""
+        if not self.isEnabled():
+            return T.PAPER_HI, T.INK_FAINT, T.INK_FAINT, 1
+        name = self.variant
+        pressed = self.isDown() or (self.isCheckable() and self.isChecked())
+        if pressed:
+            name = self.checked_variant or _PRESSED.get(name, "ink")
+            fill, text, border, _ = VARIANTS[name]
+        else:
+            fill, text, border, hover = VARIANTS.get(name, VARIANTS["paper"])
+            if self._hover:
+                fill = hover
+        return fill, text, border, 2
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        enabled = self.isEnabled()
-        fill, text_col, shadow_col = self._look()
-        sh = self._shadow
-        pressed = self.isDown() or (self.isCheckable() and self.isChecked())
-        lift = 1 if (self._hover and enabled and not pressed) else 0
-        if not enabled:
-            fill, text_col, shadow_col = T.PAPER_LO, T.INK_FAINT, T.INK_FAINT
-        base = QRectF(1, 1, self.width() - sh - 2, self.height() - sh - 2)
-        if pressed:
-            rect, shadow = base.translated(sh - 1, sh - 1), 0
-        else:
-            rect, shadow = base.translated(-lift, -lift), sh + lift
-        draw_pop_box(p, rect, fill=fill, radius=9, shadow=shadow, shadow_color=shadow_col,
-                     border=2.5 if enabled else 2.0, misreg=1.5 if enabled else 0, dots=enabled,
-                     dots_hi=0.85, dots_lo=0.0, ramp_angle=60, speckle=0.003 if enabled else 0,
-                     border_color=T.INK if enabled else T.INK_FAINT)
+        fill, text_col, border, bw = self._look()
+        rect = QRectF(self.rect())
+        draw_box(p, rect, fill=fill, border=bw, border_color=border)
         self._paint_content(p, rect, QColor(text_col))
+        if self.hasFocus():
+            _focus_ring(p, rect, T.PAPER if fill in (T.INK, T.RED, T.RED_DARK) else T.RED)
 
     def _paint_content(self, p: QPainter, rect: QRectF, col: QColor) -> None:
-        p.setFont(T.font_mono(self._px, True))
+        p.setFont(T.font_label(self._px, True))
         p.setPen(col)
         fm = p.fontMetrics()
         iw = 18 if self.icon_name else 0
-        gap = 7 if self.icon_name and self.text() else 0
+        gap = 8 if self.icon_name and self.text() else 0
         text = fm.elidedText(self.text(), Qt.TextElideMode.ElideRight, max(8, int(rect.width() - 14 - iw - gap)))
         tw = fm.horizontalAdvance(text)
         total = tw + iw + gap
@@ -183,53 +131,50 @@ class PopButton(QAbstractButton, Translatable):
             draw_icon(p, self.icon_name, QRectF(x, rect.center().y() - iw / 2, iw, iw), col, 1.9)
             x += iw + gap
         if text:
-            p.drawText(QRectF(x, rect.top(), tw + 2, rect.height()), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                       text)
+            p.drawText(QRectF(x, rect.top(), tw + 2, rect.height()),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, text)
 
 
 class ToolButton(PopButton):
-    """Wide tool selector: colour chip with icon + label; fills with the tool colour when active."""
+    """Wide tool selector: a black square with the icon, then the name; the active tool is a red bar."""
 
-    def __init__(self, key: str, color: str, icon: str, parent: Optional[QWidget] = None):
-        super().__init__(key, "paper", icon, parent, height=46, shadow=4, px=12)
-        self.color = color
+    def __init__(self, key: str, icon: str, parent: Optional[QWidget] = None):
+        super().__init__(key, "paper", icon, parent, height=44, px=12)
         self.setCheckable(True)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def _look(self):
-        if self.isChecked():
-            return (self.color, T.INK, T.INK)
-        return VARIANTS["paper"]
-
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        sh = self._shadow
-        pressed = self.isChecked() or self.isDown()
-        lift = 1 if (self._hover and not pressed and self.isEnabled()) else 0
-        base = QRectF(1, 1, self.width() - sh - 2, self.height() - sh - 2)
-        rect, shadow = (base.translated(sh - 1, sh - 1), 0) if pressed else (base.translated(-lift, -lift), sh + lift)
-        fill = self.color if self.isChecked() else T.PAPER_HI
-        draw_pop_box(p, rect, fill=fill, radius=10, shadow=shadow, border=2.5, misreg=1.5 if self.isChecked() else 0,
-                     dots=self.isChecked(), dots_hi=0.9, ramp_angle=40, speckle=0.003)
-        chip = QRectF(rect.left() + 8, rect.center().y() - 15, 30, 30)
-        draw_pop_box(p, chip, fill=self.color if not self.isChecked() else T.PAPER_HI, radius=7, shadow=0,
-                     border=2.2, misreg=1.2, dots=not self.isChecked(), dots_hi=0.7, ramp_angle=60)
-        draw_icon(p, self.icon_name or "", chip.adjusted(5, 5, -5, -5), QColor(T.INK), 1.9)
-        p.setFont(T.font_mono(self._px, True))
-        p.setPen(QColor(T.INK))
-        p.drawText(QRectF(chip.right() + 11, rect.top(), rect.width() - 56, rect.height()),
+        on, enabled = self.isChecked(), self.isEnabled()
+        rect = QRectF(self.rect())
+        if not enabled:
+            fill, edge, text_col, chip = T.PAPER_HI, T.INK_FAINT, T.INK_FAINT, T.INK_FAINT
+        elif on:
+            fill, edge, text_col, chip = T.RED, T.RED, T.PAPER, T.INK
+        else:
+            fill, edge, text_col, chip = (T.PAPER_LO if self._hover else T.PAPER_HI), T.INK, T.INK, T.INK
+        draw_box(p, rect, fill=fill, border=2 if enabled else 1, border_color=edge)
+        side = rect.height()
+        p.fillRect(QRectF(rect.left(), rect.top(), side, side), QColor(chip))
+        draw_icon(p, self.icon_name or "", QRectF(rect.left(), rect.top(), side, side).adjusted(11, 11, -11, -11),
+                  QColor(T.PAPER), 1.9)
+        p.setFont(T.font_label(self._px, True))
+        p.setPen(QColor(text_col))
+        p.drawText(QRectF(rect.left() + side + 12, rect.top(), rect.width() - side - 20, rect.height()),
                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self.text())
+        if self.hasFocus():
+            _focus_ring(p, QRectF(rect.left() + side, rect.top(), rect.width() - side, rect.height()).adjusted(-3, 0, 0, 0),
+                        T.PAPER if on else T.RED)
 
 
 class PopCheck(QAbstractButton, Translatable):
     toggledBool = Signal(bool)
 
-    def __init__(self, key: str = "", checked: bool = False, parent: Optional[QWidget] = None,
-                 accent: str = T.BLUE, text: Optional[str] = None):
+    def __init__(self, key: str = "", checked: bool = False, parent: Optional[QWidget] = None, *,
+                 text: Optional[str] = None):
         super().__init__(parent)
         self.init_key(key)
         self._literal = text
-        self.accent = accent
         self.setCheckable(True)
         self.setChecked(checked)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -254,22 +199,24 @@ class PopCheck(QAbstractButton, Translatable):
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         on = self.isEnabled()
-        box = QRectF(2, (self.height() - 20) / 2, 20, 20)
-        draw_pop_box(p, box, fill=self.accent if self.isChecked() else T.PAPER_HI, radius=5, shadow=2 if on else 0,
-                     border=2.2, dots=self.isChecked(), dots_hi=0.7,
-                     border_color=T.INK if on else T.INK_FAINT)
+        box = QRectF(1, (self.height() - 18) / 2, 18, 18)
         if self.isChecked():
-            draw_icon(p, "check", box.adjusted(2, 2, -2, -2),
-                      QColor(T.PAPER_HI if self.accent in (T.BLUE,) else T.INK), 2.6)
+            fill, edge = (T.RED, T.RED) if on else (T.INK_FAINT, T.INK_FAINT)
+        else:
+            fill, edge = T.PAPER_HI, (T.INK if on else T.INK_FAINT)
+        draw_box(p, box, fill=fill, border=2 if on else 1, border_color=edge)
+        if self.isChecked():
+            draw_icon(p, "check", box.adjusted(3, 3, -3, -3), QColor(T.PAPER), 2.6)
         f = T.font_ui(12, True)
         p.setFont(f)
         p.setPen(QColor(T.INK if on else T.INK_FAINT))
-        label = QFontMetrics(f).elidedText(self.text(), Qt.TextElideMode.ElideRight, max(10, self.width() - 34))
+        label = QFontMetrics(f).elidedText(self.text(), Qt.TextElideMode.ElideRight, max(10, self.width() - 32))
         self.setToolTip(self.text() if label != self.text() else "")
-        p.drawText(QRectF(32, 0, self.width() - 32, self.height()),
-                   Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+        text_rect = QRectF(30, 0, self.width() - 30, self.height())
+        p.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+        if self.hasFocus():
+            _focus_ring(p, QRectF(box).adjusted(-4, -4, 4.5, 4.5), T.RED)
 
 
 # ====================================================================== sliders / segments
@@ -278,11 +225,10 @@ class PopSlider(QWidget, Translatable):
     valueChanged = Signal(float)
 
     def __init__(self, key: str, minimum: float, maximum: float, value: float, *, step: float = 0.01,
-                 decimals: int = 2, color: str = T.BLUE, parent: Optional[QWidget] = None,
-                 suffix: str = ""):
+                 decimals: int = 2, parent: Optional[QWidget] = None, suffix: str = ""):
         super().__init__(parent)
         self.init_key(key)
-        self.min, self.max, self.step, self.decimals, self.color, self.suffix = minimum, maximum, step, decimals, color, suffix
+        self.min, self.max, self.step, self.decimals, self.suffix = minimum, maximum, step, decimals, suffix
         self._value = float(value)
         self._drag = False
         self.setFixedHeight(44)
@@ -312,7 +258,7 @@ class PopSlider(QWidget, Translatable):
         self.setValue(self._value)
 
     def _track(self) -> QRectF:
-        return QRectF(11, 25, self.width() - 11 - 13, 10)
+        return QRectF(7, 24, self.width() - 14, 14)
 
     def _pos(self, v: float) -> float:
         t = self._track()
@@ -328,6 +274,7 @@ class PopSlider(QWidget, Translatable):
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag = True
             self.setValue(self._from_x(e.position().x()), emit=True)
+            self.update()
 
     def mouseMoveEvent(self, e) -> None:
         if self._drag:
@@ -335,6 +282,7 @@ class PopSlider(QWidget, Translatable):
 
     def mouseReleaseEvent(self, e) -> None:
         self._drag = False
+        self.update()
 
     def wheelEvent(self, e) -> None:
         d = 1 if e.angleDelta().y() > 0 else -1
@@ -352,51 +300,40 @@ class PopSlider(QWidget, Translatable):
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         on = self.isEnabled()
-        p.setFont(T.font_mono(10.5, True))
-        p.setPen(QColor(T.INK if on else T.INK_FAINT))
-        p.drawText(QRectF(2, 0, self.width() - 60, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+        ink = QColor(T.INK if on else T.INK_FAINT)
+        p.setFont(T.font_label(10.5, True, 1.0))
+        p.setPen(ink)
+        p.drawText(QRectF(0, 0, self.width() - 64, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                    self.text_now())
-        p.setFont(T.font_mono(10.5, False))
+        p.setFont(T.font_ui(11.5, True))
         txt = f"{self._value:.{self.decimals}f}{self.suffix}"
-        p.drawText(QRectF(self.width() - 64, 0, 62, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, txt)
+        p.drawText(QRectF(self.width() - 64, 0, 64, 20), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, txt)
 
         t = self._track()
-        draw_pop_box(p, t, fill=T.PAPER_HI, radius=5, shadow=0, border=2.2,
-                     border_color=T.INK if on else T.INK_FAINT)
+        cy = t.center().y()
         hx = self._pos(self._value)
-        if hx > t.left() + 4:
-            fillr = QRectF(t.left() + 1.4, t.top() + 1.4, hx - t.left() - 1.4, t.height() - 2.8)
-            p.save()
-            p.setClipPath(rrect(t.adjusted(1.4, 1.4, -1.4, -1.4), 3.6))
-            p.fillRect(fillr, QColor(self.color if on else T.INK_FAINT))
-            draw_dots(p, fillr, dot_color(QColor(self.color)), ramp_angle=0, lo=0.2, hi=0.9, spacing=5)
-            p.restore()
-        knob = QRectF(hx - 10, t.center().y() - 10, 20, 20)
-        draw_pop_box(p, knob, fill=T.PAPER_HI, radius=10, shadow=2 if on else 0, border=2.4, misreg=0,
-                     border_color=T.INK if on else T.INK_FAINT)
-        if self.hasFocus():
-            pen = QPen(QColor(T.BLUE), 1.6, Qt.PenStyle.DashLine)
-            p.setPen(pen)
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawRoundedRect(QRectF(0.8, 0.8, self.width() - 1.6, self.height() - 1.6), 6, 6)
+        p.fillRect(QRectF(t.left(), cy - 1, t.width(), 2), ink)                         # the rule
+        if hx > t.left():
+            p.fillRect(QRectF(t.left(), cy - 2.5, hx - t.left(), 5), QColor(T.RED if on else T.INK_FAINT))
+        knob = QRectF(round(hx) - 4, cy - 8, 8, 16)
+        active = on and (self._drag or self.hasFocus())
+        p.fillRect(knob, QColor(T.RED if active else ink))
 
 
 class PopSegmented(QWidget):
-    """Equal-width segments; the active one is filled with ``color`` and dotted."""
+    """Equal-width cells in one outline; the chosen one is black."""
     currentChanged = Signal(str)
 
-    def __init__(self, items: Sequence[tuple[str, str]], current: str, color: str = T.GREEN,
-                 parent: Optional[QWidget] = None):
+    def __init__(self, items: Sequence[tuple[str, str]], current: str, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.items = list(items)               # (id, translation key)
-        self.color = color
         self._current = current
         self._hover = -1
-        self.setFixedHeight(40)
+        self.setFixedHeight(38)
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def retranslate(self) -> None:
@@ -404,6 +341,15 @@ class PopSegmented(QWidget):
 
     def current(self) -> str:
         return self._current
+
+    def keyPressEvent(self, e) -> None:
+        step = {Qt.Key.Key_Left: -1, Qt.Key.Key_Up: -1, Qt.Key.Key_Right: 1, Qt.Key.Key_Down: 1}.get(e.key(), 0)
+        if not step or not self.items:
+            super().keyPressEvent(e)
+            return
+        ids = [i for i, _ in self.items]
+        idx = ids.index(self._current) if self._current in ids else 0
+        self.setCurrent(ids[max(0, min(len(ids) - 1, idx + step))], emit=True)
 
     def setCurrent(self, ident: str, emit: bool = False) -> None:
         if ident != self._current:
@@ -413,7 +359,7 @@ class PopSegmented(QWidget):
                 self.currentChanged.emit(ident)
 
     def _index_at(self, x: float) -> int:
-        w = (self.width() - 6) / max(len(self.items), 1)
+        w = self.width() / max(len(self.items), 1)
         return max(0, min(len(self.items) - 1, int(x // w)))
 
     def mouseMoveEvent(self, e) -> None:
@@ -432,25 +378,27 @@ class PopSegmented(QWidget):
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        outer = QRectF(1, 1, self.width() - 5, self.height() - 5)
-        draw_pop_box(p, outer, fill=T.PAPER_HI, radius=9, shadow=3, border=2.5)
+        outer = QRectF(self.rect())
+        enabled = self.isEnabled()
+        edge = T.INK if enabled else T.INK_FAINT
+        draw_box(p, outer, fill=T.PAPER_HI, border=2, border_color=edge)
         n = max(len(self.items), 1)
         seg_w = outer.width() / n
-        p.setFont(T.font_mono(11, True))
+        p.setFont(T.font_label(10.5, True, 0.8))
         for i, (ident, key) in enumerate(self.items):
             r = QRectF(outer.left() + seg_w * i, outer.top(), seg_w, outer.height())
-            if ident == self._current:
-                inner = r.adjusted(3, 3, -3, -3)
-                draw_pop_box(p, inner, fill=self.color, radius=6, shadow=0, border=2.0, misreg=1.2,
-                             dots=True, dots_hi=0.9, ramp_angle=50, speckle=0.003)
-            elif i == self._hover:
-                p.fillPath(rrect(r.adjusted(4, 4, -4, -4), 5), QColor(T.PAPER_LO))
-            if 0 < i < n and ident != self._current and self.items[i - 1][0] != self._current:
-                p.setPen(QPen(QColor(T.INK), 1.4))
-                p.drawLine(QPointF(r.left(), r.top() + 9), QPointF(r.left(), r.bottom() - 9))
-            p.setPen(QColor(T.INK))
-            p.drawText(r, Qt.AlignmentFlag.AlignCenter, tr(key))
+            chosen = ident == self._current
+            if chosen:
+                p.fillRect(r.adjusted(2 if i == 0 else 0, 2, -2 if i == n - 1 else 0, -2), QColor(edge))
+            elif i == self._hover and enabled:
+                p.fillRect(r.adjusted(2 if i == 0 else 0, 2, -2 if i == n - 1 else 0, -2), QColor(T.PAPER_LO))
+            if i > 0:
+                p.fillRect(QRectF(round(r.left()) - 1, outer.top() + 2, 2, outer.height() - 4), QColor(edge))
+            p.setPen(QColor(T.PAPER if chosen else (T.INK if enabled else T.INK_FAINT)))
+            label = p.fontMetrics().elidedText(tr(key), Qt.TextElideMode.ElideRight, max(8, int(seg_w - 8)))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, label)
+        if self.hasFocus():
+            _focus_ring(p, outer, T.RED, inset=3.0)
 
 
 # ====================================================================== labels / containers
@@ -460,8 +408,8 @@ class SectionLabel(QLabel, Translatable):
         super().__init__(parent)
         self.init_key(key)
         self._literal = text
-        self.setFont(T.font_mono(10.5, True, 1.0))
-        self.setStyleSheet(f"color: {T.INK_SOFT}; background: transparent;")
+        self.setFont(T.font_label(10.5, True, 1.2))
+        self.setStyleSheet(f"color: {T.INK}; background: transparent;")
         self.retranslate()
 
     def retranslate(self) -> None:
@@ -469,11 +417,15 @@ class SectionLabel(QLabel, Translatable):
 
 
 class HintLabel(QLabel, Translatable):
+    """Small grey explanation text. ``provider`` (a callable returning the text) wins over ``key`` / ``text`` and is
+    asked again on every language change."""
+
     def __init__(self, key: str = "", parent: Optional[QWidget] = None, *, text: Optional[str] = None,
-                 px: float = 11.5, **fmt):
+                 px: float = 11.5, provider=None, **fmt):
         super().__init__(parent)
         self.init_key(key, **fmt)
         self._literal = text
+        self._provider = provider
         self.setFont(T.font_ui(px))
         self.setWordWrap(True)
         self.setStyleSheet(f"color: {T.INK_SOFT}; background: transparent;")
@@ -481,51 +433,55 @@ class HintLabel(QLabel, Translatable):
         self.retranslate()
 
     def retranslate(self) -> None:
-        self.setText(self._literal if self._literal is not None else self.text_now())
+        if self._provider is not None:
+            self.setText(self._provider())
+        else:
+            self.setText(self._literal if self._literal is not None else self.text_now())
 
 
 class Chip(QLabel):
-    """Small status pill."""
+    """Small status label. ``tone``: ``paper`` (outline), ``ink`` (black) or ``red``."""
 
-    def __init__(self, text: str = "", color: str = T.PAPER_HI, parent: Optional[QWidget] = None):
+    TONES = {"paper": (T.PAPER_HI, T.INK, T.INK), "ink": (T.INK, T.PAPER, T.INK), "red": (T.RED, T.PAPER, T.RED)}
+
+    def __init__(self, text: str = "", tone: str = "paper", parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.color = color
+        self.tone = tone
         self._text = text
         self.setFixedHeight(20)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-    def set_chip(self, text: str, color: str) -> None:
-        self._text, self.color = text, color
+    def set_chip(self, text: str, tone: str) -> None:
+        self._text, self.tone = text, tone
         self.updateGeometry()
         self.update()
 
     def sizeHint(self) -> QSize:
-        fm = QFontMetrics(T.font_mono(9.5, True))
+        fm = QFontMetrics(T.font_label(9.5, True, 0.8))
         return QSize(fm.horizontalAdvance(self._text) + 18, 20)
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        r = QRectF(1, 1, self.width() - 2, self.height() - 2)
-        draw_pop_box(p, r, fill=self.color, radius=10, shadow=0, border=1.8, dots=True, dots_hi=0.8, ramp_angle=30)
-        p.setFont(T.font_mono(9.5, True))
-        p.setPen(QColor(T.TEXT_ON.get(self.color, T.INK)))
+        fill, text, edge = self.TONES.get(self.tone, self.TONES["paper"])
+        r = QRectF(self.rect())
+        draw_box(p, r, fill=fill, border=1.5, border_color=edge)
+        p.setFont(T.font_label(9.5, True, 0.8))
+        p.setPen(QColor(text))
         p.drawText(r, Qt.AlignmentFlag.AlignCenter, self._text)
 
 
 class PopPanel(QFrame, Translatable):
-    """Paper card with a coloured, dotted title tab. Put content into ``self.body``."""
+    """A section: heavy black rule, a red marker, the title in bold capitals, a hairline. Put content into ``self.body``."""
 
-    def __init__(self, key: str = "", accent: str = T.YELLOW, parent: Optional[QWidget] = None, *,
-                 text: Optional[str] = None, tab: bool = True):
+    TITLE_H = 30
+
+    def __init__(self, key: str = "", parent: Optional[QWidget] = None, *, text: Optional[str] = None):
         super().__init__(parent)
         self.init_key(key)
         self._literal = text
-        self.accent = accent
-        self._tab = tab
-        self._title_h = 26 if tab else 0
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.body = QVBoxLayout(self)
-        self.body.setContentsMargins(12, self._title_h + 10, 12 + 4, 12 + 4)
+        self.body.setContentsMargins(0, int(T.RULE) + self.TITLE_H + 12, 0, 16)
         self.body.setSpacing(10)
         self.retranslate()
 
@@ -535,35 +491,25 @@ class PopPanel(QFrame, Translatable):
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        sh = 4
-        outer = QRectF(1, 1, self.width() - sh - 2, self.height() - sh - 2)
-        draw_pop_box(p, outer, fill=T.PAPER_HI, radius=10, shadow=sh, border=2.5)
-        if self._tab:
-            tab = QRectF(outer.left() + 2.6, outer.top() + 2.6, outer.width() - 5.2, self._title_h - 2)
-            path = QPainterPath()
-            path.addRoundedRect(tab, 7, 7)
-            p.save()
-            p.setClipPath(path)
-            p.fillRect(tab.translated(1.5, 1.5), QColor(self.accent))
-            draw_dots(p, tab, dot_color(QColor(self.accent)), ramp_angle=0, lo=0.1, hi=0.95, spacing=6, speckle=0.004)
-            p.restore()
-            p.setPen(QPen(QColor(T.INK), 2.2))
-            p.drawLine(QPointF(tab.left(), tab.bottom()), QPointF(tab.right(), tab.bottom()))
-            p.setFont(T.font_mono(10.5, True, 1.2))
-            p.setPen(QColor(T.TEXT_ON.get(self.accent, T.INK)))
-            p.drawText(tab.adjusted(10, 0, -8, 0), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, self._title)
+        w = float(self.width())
+        p.fillRect(QRectF(0, 0, w, T.RULE), QColor(T.INK))
+        top = T.RULE
+        p.fillRect(QRectF(0, top + (self.TITLE_H - 9) / 2, 9, 9), QColor(T.RED))
+        p.setFont(T.font_label(10.5, True, 1.4))
+        p.setPen(QColor(T.INK))
+        p.drawText(QRectF(18, top, w - 18, self.TITLE_H), Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                   self._title)
+        p.fillRect(QRectF(0, top + self.TITLE_H, w, T.HAIR), QColor(T.INK))
 
 
 class PopProgress(QWidget):
-    """Thick progress bar with a dotted fill."""
+    """Progress bar: outlined track, red fill."""
 
-    def __init__(self, color: str = T.RED, parent: Optional[QWidget] = None):
+    def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
-        self.color = color
         self._v = 0.0
         self._text = ""
-        self.setFixedHeight(26)
+        self.setFixedHeight(24)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
     def set_progress(self, v: float, text: str = "") -> None:
@@ -572,29 +518,20 @@ class PopProgress(QWidget):
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        r = QRectF(1.5, 1.5, self.width() - 3, self.height() - 3)
-        draw_pop_box(p, r, fill=T.PAPER_HI, radius=8, shadow=0, border=2.4)
+        r = QRectF(self.rect())
+        inner = draw_box(p, r, fill=T.PAPER_HI, border=2, border_color=T.INK)
         if self._v > 0.001:
-            inner = r.adjusted(2.4, 2.4, -2.4, -2.4)
-            fr = QRectF(inner.left(), inner.top(), max(8.0, inner.width() * self._v), inner.height())
-            p.save()
-            p.setClipPath(rrect(inner, 5))
-            p.fillRect(fr, QColor(self.color))
-            draw_dots(p, fr, dot_color(QColor(self.color)), ramp_angle=0, lo=0.3, hi=1.0, spacing=5)
-            p.setPen(QPen(QColor(T.INK), 2.0))
-            p.drawLine(QPointF(fr.right(), fr.top()), QPointF(fr.right(), fr.bottom()))
-            p.restore()
+            p.fillRect(QRectF(inner.left(), inner.top(), max(2.0, inner.width() * self._v), inner.height()), QColor(T.RED))
         if self._text:
-            # ink text with a paper halo: readable on the dotted fill, on the empty track and across the divider line
-            f = T.font_mono(10.5, True)
+            # black text with a white halo: readable on the red fill and on the empty track alike
+            f = T.font_label(10.5, True, 0.6)
             fm = QFontMetricsF(f)
             x = r.center().x() - fm.horizontalAdvance(self._text) / 2.0
             y = r.center().y() + (fm.ascent() - fm.descent()) / 2.0
             path = QPainterPath()
             path.addText(QPointF(x, y), f, self._text)
-            p.setPen(QPen(QColor(T.PAPER_HI), 3.6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                          Qt.PenJoinStyle.RoundJoin))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setPen(QPen(QColor(T.PAPER_HI), 3.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPath(path)
             p.setPen(Qt.PenStyle.NoPen)

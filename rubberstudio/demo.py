@@ -10,10 +10,10 @@ DEMO_TEXTS = ("SUMMER SALE 50% OFF", "www.example-shop.com", "© 2026 Sample Stu
 
 
 def _font(name: str, size: int, basic_layout: bool = True) -> ImageFont.FreeTypeFont:
-    """Bundled font. The basic layout engine is forced: with Raqm (present in Pillow on some systems, absent on
+    """Bundled sample-picture font (the interface itself uses Liberation Sans). The basic layout engine is forced: with Raqm (present in Pillow on some systems, absent on
     others, e.g. plain Windows) the glyph advances differ by a fraction of a pixel and the picture would not be
     pixel-identical from one machine to the next — which the self-test, the screenshots and the tests rely on."""
-    path = resource_path("assets", "fonts", name)
+    path = resource_path("assets", "fonts", "demo", name)
     try:
         if basic_layout:
             return ImageFont.truetype(str(path), size, layout_engine=ImageFont.Layout.BASIC)

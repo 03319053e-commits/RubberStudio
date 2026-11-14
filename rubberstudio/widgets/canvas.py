@@ -14,20 +14,17 @@ from .. import theme as T
 from ..editor import EditorModel, Tool
 from ..i18n import tr
 from .icons import draw_icon
-from .pop import PopButton, dot_color, draw_dots, draw_pop_box, paper_brush, rrect
-from .textures import halftone_pixmap, tint
+from .pop import PopButton, draw_box
 
-SHADOW = 5
-IMG_SHADOW = 8
-HANDLE_R = 7.5
+HANDLE = 6.5            # half the side of a drag handle
 
 
 def _checker() -> QBrush:
     pm = QPixmap(16, 16)
     pm.fill(QColor(T.PAPER_HI))
     p = QPainter(pm)
-    p.fillRect(0, 0, 8, 8, QColor("#E2D9C4"))
-    p.fillRect(8, 8, 8, 8, QColor("#E2D9C4"))
+    p.fillRect(0, 0, 8, 8, QColor("#D6D6D6"))
+    p.fillRect(8, 8, 8, 8, QColor("#D6D6D6"))
     p.end()
     return QBrush(pm)
 
@@ -58,12 +55,12 @@ class Canvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMinimumSize(320, 240)
 
-        self.fit_btn = PopButton(variant="paper", icon="fit", text="", height=34, shadow=3)
+        self.fit_btn = PopButton(variant="paper", icon="fit", text="", height=34)
         self.fit_btn.setFixedWidth(42)
         self.fit_btn.setParent(self)
         self.fit_btn.clicked.connect(self.fit)
         self.fit_btn.setToolTip(tr("canvas.fit"))
-        self.cmp_btn = PopButton("canvas.compare", "yellow", "compare", self, height=34, shadow=3, px=11)
+        self.cmp_btn = PopButton("canvas.compare", "ink", "compare", self, height=34, px=11)
         self.cmp_btn.setCheckable(True)
         self.cmp_btn.clicked.connect(self.model.toggle_compare)
         self.cmp_btn.hide()
@@ -84,13 +81,13 @@ class Canvas(QWidget):
         self.update()
 
     def _frame(self) -> QRectF:
-        return QRectF(1, 1, self.width() - SHADOW - 2, self.height() - SHADOW - 2)
+        return QRectF(1, 1, self.width() - 2, self.height() - 2)
 
     def _fit_scale(self) -> float:
         iw, ih = self.model.size
         if iw <= 0 or ih <= 0:
             return 1.0
-        avail = self._frame().adjusted(26, 26, -26 - IMG_SHADOW, -26 - IMG_SHADOW)
+        avail = self._frame().adjusted(26, 26, -26, -26)
         return max(0.01, min(avail.width() / iw, avail.height() / ih, 4.0))
 
     def scale(self) -> float:
@@ -102,8 +99,8 @@ class Canvas(QWidget):
             return QRectF()
         s = self.scale()
         f = self._frame()
-        cx = f.center().x() + self.pan.x() - IMG_SHADOW / 2
-        cy = f.center().y() + self.pan.y() - IMG_SHADOW / 2
+        cx = f.center().x() + self.pan.x()
+        cy = f.center().y() + self.pan.y()
         return QRectF(cx - iw * s / 2, cy - ih * s / 2, iw * s, ih * s)
 
     def to_image(self, pos: QPointF) -> QPointF:
@@ -118,9 +115,9 @@ class Canvas(QWidget):
         self.update()
 
     def resizeEvent(self, e) -> None:
-        self.fit_btn.move(int(self.width() - SHADOW - 14 - self.fit_btn.width()), 14)
+        self.fit_btn.move(int(self.width() - 14 - self.fit_btn.width()), 14)
         self.cmp_btn.adjustSize()
-        self.cmp_btn.move(int(self.width() - SHADOW - 14 - self.fit_btn.width() - 10 - self.cmp_btn.width()), 14)
+        self.cmp_btn.move(int(self.width() - 14 - self.fit_btn.width() - 10 - self.cmp_btn.width()), 14)
         self.zoomChanged.emit(self.scale())
 
     # ------------------------------------------------------------------ model reactions
@@ -168,9 +165,6 @@ class Canvas(QWidget):
         elif m.tool == Tool.BATCH:
             m.batch_rect = rel
         m.overlayChanged.emit()
-
-    def _accent(self) -> str:
-        return {Tool.CROP: T.YELLOW, Tool.ERASE: T.RED, Tool.BATCH: T.BLUE}.get(self.model.tool, T.YELLOW)
 
     def _rect_to_widget(self, rel: tuple) -> QRectF:
         r = self._img_rect
@@ -346,8 +340,7 @@ class Canvas(QWidget):
         iw, ih = self.model.size
         left = pos.x() - anchor.x() * new_s
         top = pos.y() - anchor.y() * new_s
-        self.pan = QPointF(left + iw * new_s / 2 - f.center().x() + IMG_SHADOW / 2,
-                           top + ih * new_s / 2 - f.center().y() + IMG_SHADOW / 2)
+        self.pan = QPointF(left + iw * new_s / 2 - f.center().x(), top + ih * new_s / 2 - f.center().y())
         if abs(self.zoom - 1.0) < 0.02:
             self.zoom, self.pan = 1.0, QPointF(0, 0)
         self.zoomChanged.emit(self.scale())
@@ -399,48 +392,27 @@ class Canvas(QWidget):
         return QRectF(self._img_rect.left() + r.x() * s, self._img_rect.top() + r.y() * s, r.width() * s, r.height() * s)
 
     def _paint_desk(self, p: QPainter, f: QRectF) -> QPainterPath:
-        draw_pop_box(p, f, fill=T.PAPER_LO, radius=16, shadow=SHADOW, border=2.5)
-        inner = rrect(f.adjusted(1.25, 1.25, -1.25, -1.25), 15)
-        p.save()
-        p.setClipPath(inner)
-        p.fillRect(f, paper_brush(T.PAPER_LO, 5))
-        # halftone corners, like the colour bars of a print sheet
-        ink = QColor(T.INK)
-        ink.setAlphaF(0.085)
-        for rect, ramp in ((QRectF(f.left(), f.top(), 340, 300), 225.0), (QRectF(f.right() - 340, f.bottom() - 300, 340, 300), 45.0)):
-            pm = halftone_pixmap(int(rect.width()), int(rect.height()), tint(ink), 9.0, 45.0, ramp, 0.0, 1.0, 0.62, 0.0)
-            p.drawPixmap(rect.topLeft(), pm)
-        # registration marks
-        pen = QPen(QColor(T.INK), 1.6)
-        p.setPen(pen)
-        for cx, cy in ((f.left() + 30, f.bottom() - 30), (f.right() - 30, f.top() + 30)):
-            p.setBrush(Qt.BrushStyle.NoBrush)
-            p.drawEllipse(QPointF(cx, cy), 9, 9)
-            p.drawLine(QPointF(cx - 15, cy), QPointF(cx + 15, cy))
-            p.drawLine(QPointF(cx, cy - 15), QPointF(cx, cy + 15))
-        p.restore()
-        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        pen = QPen(QColor(T.INK), 2.5)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawPath(rrect(f.adjusted(1.25, 1.25, -1.25, -1.25), 15))
-        return inner
+        """The grey desk the picture lies on, inside a black outline. Returns the area inside the outline."""
+        inner = draw_box(p, f, fill=T.PAPER_LO, border=2)
+        path = QPainterPath()
+        path.addRect(inner)
+        return path
 
     def _paint_empty(self, p: QPainter, f: QRectF) -> None:
         box = QRectF(0, 0, min(460, f.width() - 60), 270)
         box.moveCenter(f.center())
-        pen = QPen(QColor(T.INK_SOFT), 2.4, Qt.PenStyle.CustomDashLine)
-        pen.setDashPattern([4, 4])
+        pen = QPen(QColor(T.INK), 1.5, Qt.PenStyle.CustomDashLine)
+        pen.setDashPattern([4, 3])
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(box, 18, 18)
-        ic = QRectF(0, 0, 84, 84)
-        ic.moveCenter(QPointF(box.center().x(), box.top() + 96))
-        draw_pop_box(p, ic, fill=T.YELLOW, radius=16, shadow=5, border=3, misreg=2.5, dots=True, dots_hi=0.95)
-        draw_icon(p, "photo", ic.adjusted(16, 16, -16, -16), QColor(T.INK), 2.2)
+        p.drawRect(box)
+        ic = QRectF(0, 0, 76, 76)
+        ic.moveCenter(QPointF(box.center().x(), box.top() + 88))
+        p.fillRect(ic, QColor(T.RED))
+        draw_icon(p, "photo", ic.adjusted(16, 16, -16, -16), QColor(T.PAPER), 2.2)
         p.setPen(QColor(T.INK))
-        p.setFont(T.font_mono(15, True, 1.2))
-        p.drawText(QRectF(box.left(), box.top() + 150, box.width(), 30), Qt.AlignmentFlag.AlignHCenter, tr("canvas.empty.title"))
+        p.setFont(T.font_label(15, True, 1.6))
+        p.drawText(QRectF(box.left(), box.top() + 146, box.width(), 30), Qt.AlignmentFlag.AlignHCenter, tr("canvas.empty.title"))
         p.setPen(QColor(T.INK_SOFT))
         p.setFont(T.font_ui(12))
         p.drawText(QRectF(box.left() + 20, box.top() + 184, box.width() - 40, 60),
@@ -476,9 +448,7 @@ class Canvas(QWidget):
         p.setClipPath(inner)
         scale = ir.width() / img.width()
 
-        # hard shadow + (transparent) backdrop
-        p.fillRect(ir.translated(IMG_SHADOW, IMG_SHADOW), QColor(T.INK))
-        if m.has_alpha:
+        if m.has_alpha:                      # transparent pictures lie on a chequerboard
             p.fillRect(ir, self._checker)
 
         vis = ir.intersected(QRectF(f))
@@ -492,11 +462,11 @@ class Canvas(QWidget):
                          vis.width() / scale * f_, vis.height() / scale * f_)
             p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, scale < 2.0 and self._mode != "stroke")
             p.drawImage(vis, src_img, src)
-        pen = QPen(QColor(T.INK), 2.5)
+        pen = QPen(QColor(T.INK), 2.0)
         pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRect(ir)
+        p.drawRect(ir.adjusted(-1, -1, 1, 1))
 
         self._paint_overlays(p, ir, scale)
         p.restore()
@@ -504,10 +474,10 @@ class Canvas(QWidget):
         # HUD: zoom readout
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         txt = f"{int(round(self.scale() * 100))}%   {img.width()}×{img.height()}"
-        p.setFont(T.font_mono(10.5, True))
+        p.setFont(T.font_label(10.5, True, 0.8))
         tw = p.fontMetrics().horizontalAdvance(txt) + 22
         chip = QRectF(f.left() + 14, f.bottom() - 40, tw, 26)
-        draw_pop_box(p, chip, fill=T.PAPER_HI, radius=8, shadow=3, border=2.2)
+        draw_box(p, chip, fill=T.PAPER_HI, border=2)
         p.setPen(QColor(T.INK))
         p.drawText(chip, Qt.AlignmentFlag.AlignCenter, txt)
         if m.busy:
@@ -516,9 +486,9 @@ class Canvas(QWidget):
     def _paint_busy(self, p: QPainter, f: QRectF) -> None:
         w = 170
         chip = QRectF(f.center().x() - w / 2, f.top() + 16, w, 34)
-        draw_pop_box(p, chip, fill=T.YELLOW, radius=10, shadow=4, border=2.4, misreg=2, dots=True, dots_hi=0.9)
-        p.setFont(T.font_mono(11, True, 1.2))
-        p.setPen(QColor(T.INK))
+        draw_box(p, chip, fill=T.RED, border=0)
+        p.setFont(T.font_label(11, True, 1.4))
+        p.setPen(QColor(T.PAPER))
         p.drawText(chip, Qt.AlignmentFlag.AlignCenter, tr("busy"))
 
     def _paint_overlays(self, p: QPainter, ir: QRectF, scale: float) -> None:
@@ -542,7 +512,6 @@ class Canvas(QWidget):
         rel = self._active_rect()
         if rel is not None:
             wr = self._rect_to_widget(rel)
-            accent = QColor(self._accent())
             dim = QColor(T.INK)
             dim.setAlphaF(0.42)
             path = QPainterPath()
@@ -565,19 +534,19 @@ class Canvas(QWidget):
             p.setPen(dash)
             p.drawRect(wr)
             for hpt in self._handles(wr):
-                hb = QRectF(hpt.x() - HANDLE_R, hpt.y() - HANDLE_R, HANDLE_R * 2, HANDLE_R * 2)
-                draw_pop_box(p, hb, fill=accent.name(), radius=3, shadow=0, border=2.2, misreg=1.0)
+                hb = QRectF(hpt.x() - HANDLE, hpt.y() - HANDLE, HANDLE * 2, HANDLE * 2)
+                draw_box(p, hb, fill=T.RED, border=2, border_color=T.PAPER_HI)
             # size label
             iw, ih = m.size
             lab = f"{int(round(rel[2] * iw))} × {int(round(rel[3] * ih))}"
-            p.setFont(T.font_mono(10, True))
+            p.setFont(T.font_label(10, True, 0.6))
             tw = p.fontMetrics().horizontalAdvance(lab) + 16
             lr = QRectF(wr.left(), wr.top() - 28, tw, 22)
             if lr.top() < ir.top():
                 lr.moveTop(wr.top() + 6)
                 lr.moveLeft(wr.left() + 6)
-            draw_pop_box(p, lr, fill=accent.name(), radius=6, shadow=2, border=2.0, misreg=1.0, dots=True, dots_hi=0.8)
-            p.setPen(QColor(T.TEXT_ON.get(accent.name(), T.INK)))
+            draw_box(p, lr, fill=T.RED, border=0)
+            p.setPen(QColor(T.PAPER))
             p.drawText(lr, Qt.AlignmentFlag.AlignCenter, lab)
         # watermark preview
         if m.tool == Tool.WATERMARK and m.wm.text.strip():
@@ -591,7 +560,7 @@ class Canvas(QWidget):
                 p.setPen(col)
                 text = m.wm.text.upper() if m.wm.text.isascii() else m.wm.text
                 p.drawText(wr, Qt.AlignmentFlag.AlignCenter, text)
-                dash = QPen(QColor(T.PINK), 2.2, Qt.PenStyle.CustomDashLine)
+                dash = QPen(QColor(T.RED), 2.0, Qt.PenStyle.CustomDashLine)
                 dash.setDashPattern([3.5, 3.5])
                 p.setPen(dash)
                 p.setBrush(Qt.BrushStyle.NoBrush)
@@ -605,7 +574,7 @@ class Canvas(QWidget):
             p.drawEllipse(c, r, r)
             p.setPen(QPen(QColor(T.INK), 1.8))
             p.drawEllipse(c, r, r)
-            hard = QPen(QColor(T.GREEN), 1.4, Qt.PenStyle.DashLine)
+            hard = QPen(QColor(T.RED), 1.4, Qt.PenStyle.DashLine)
             p.setPen(hard)
             ri = r * (0.1 + 0.85 * m.brush.hardness)
             p.drawEllipse(c, ri, ri)

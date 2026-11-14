@@ -6,6 +6,12 @@ from rubberstudio.core.eraser import EraseOptions, TextEraser, glyphs_beside_lin
 from rubberstudio.core.textdet import TextDetector
 
 
+def _demo_font(name: str) -> str:
+    """Heavy display type and a monospace face (bundled for the sample picture) used to draw test pictures."""
+    from rubberstudio.core.paths import resource_path
+    return str(resource_path("assets", "fonts", "demo", name))
+
+
 def rgba(a):
     return np.dstack([a, np.full(a.shape[:2], 255, np.uint8)])
 
@@ -105,14 +111,13 @@ def test_demo_scene_is_fully_cleaned(detector, basic_layout):
 def test_thick_display_type_is_covered_without_holes():
     """Very dense glyphs (text covers > 50 % of a median window) must be masked completely."""
     from PIL import Image, ImageDraw, ImageFont
-    from rubberstudio.core.paths import resource_path
     from rubberstudio.core.textdet import TextBox
     w, h = 900, 260
     yy, xx = np.mgrid[0:h, 0:w]
     bg = np.stack([60 + 30 * xx / w, 120 - 40 * yy / h, 200 - 50 * xx / w], -1).astype(np.uint8)
     glyphs = Image.new("L", (w, h), 0)
     ImageDraw.Draw(glyphs).text((40, 40), "MMMMMMMM", font=ImageFont.truetype(
-        str(resource_path("assets", "fonts", "ArchivoBlack-Regular.ttf")), 150), fill=255)
+        _demo_font("ArchivoBlack-Regular.ttf"), 150), fill=255)
     gm = np.array(glyphs) > 200
     ys, xs = np.nonzero(gm)
     pad = 12
@@ -184,9 +189,7 @@ def test_side_glyph_step_can_be_switched_off():
 
 def _spacemono(size):
     from PIL import ImageFont
-    from rubberstudio.core.paths import resource_path
-    return ImageFont.truetype(str(resource_path("assets", "fonts", "SpaceMono-Bold.ttf")), size,
-                              layout_engine=ImageFont.Layout.BASIC)
+    return ImageFont.truetype(_demo_font("SpaceMono-Bold.ttf"), size, layout_engine=ImageFont.Layout.BASIC)
 
 
 def _line_scene(*, where="left", gap=12, ink=(255, 255, 255), symbol_ink=None, symbol="©", symbol_size=32,

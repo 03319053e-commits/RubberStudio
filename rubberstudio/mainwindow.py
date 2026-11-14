@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional, Sequence
 
 from PySide6.QtCore import QByteArray, Qt
-from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence, QPainter
+from PySide6.QtGui import QAction, QCloseEvent, QColor, QDragEnterEvent, QDropEvent, QKeySequence, QPainter
 from PySide6.QtWidgets import (QApplication, QFileDialog, QHBoxLayout, QMainWindow, QVBoxLayout, QWidget)
 
 from . import APP_NAME, i18n
@@ -14,8 +14,8 @@ from . import settings as S
 from . import theme as T
 from .controllers import BatchController, BatchModel, ModelController
 from .core.imageio import READ_EXTS, iter_images, is_supported
-from .core.neural import ModelManager
-from .editor import EditorModel, Tool
+from .core.neural import MODELS, ModelManager
+from .editor import ENGINES, EditorModel, Tool
 from .i18n import tr
 from .widgets import dialogs
 from .widgets.bars import HEADER_H, STATUS_H, HeaderBar, StatusBar
@@ -23,7 +23,6 @@ from .widgets.canvas import Canvas
 from .widgets.envelope import EnvelopePanel
 from .widgets.filmstrip import QueuePanel
 from .widgets.panels import ToolDrawer
-from .widgets.pop import paper_brush
 from .widgets.splash import SplashOverlay
 
 log = logging.getLogger("rubberstudio")
@@ -34,14 +33,17 @@ RIGHT_W = 332
 
 class _Central(QWidget):
     def paintEvent(self, e) -> None:
-        QPainter(self).fillRect(self.rect(), paper_brush(T.PAPER, 1))
+        QPainter(self).fillRect(self.rect(), QColor(T.PAPER))
 
 
 def load_prefs(editor: EditorModel, batch: BatchController) -> None:
     """Restore the panel settings of the last session."""
     e, b, wm, s = editor.erase, editor.brush, editor.wm, batch.settings
-    e.use_ai = S.get_bool("erase/use_ai", e.use_ai)
-    e.always_ai = S.get_bool("erase/always_ai", e.always_ai)
+    engine = S.get_str("erase/engine", "")
+    if engine not in ENGINES:                       # settings of version 1.0: two switches instead of one choice
+        engine = "fast" if not S.get_bool("erase/use_ai", True) else ("lama" if S.get_bool("erase/always_ai", False) else "auto")
+    e.engine = engine
+    e.thorough = S.get_bool("erase/thorough", e.thorough)
     e.sensitivity = min(max(S.get_float("erase/sensitivity", e.sensitivity), 0.0), 1.0)
     e.grow = min(max(S.get_float("erase/grow", e.grow), 0.0), 0.4)
     e.whole_image = S.get_bool("erase/whole", e.whole_image)
@@ -94,14 +96,14 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         self.header = HeaderBar()
-        self.header_env = EnvelopePanel(self.header, "top", HEADER_H, T.YELLOW, tooltip=tr("fold.header"))
+        self.header_env = EnvelopePanel(self.header, "top", HEADER_H, tooltip=tr("fold.header"))
         root.addWidget(self.header_env)
 
         mid = QHBoxLayout()
         mid.setContentsMargins(0, 0, 0, 0)
         mid.setSpacing(0)
         self.drawer = ToolDrawer(self.editor, self.model_ctl, self.batch_ctl)
-        self.left_env = EnvelopePanel(self.drawer, "left", LEFT_W, T.YELLOW, tooltip=tr("fold.left"))
+        self.left_env = EnvelopePanel(self.drawer, "left", LEFT_W, tooltip=tr("fold.left"))
         mid.addWidget(self.left_env)
         self.canvas = Canvas(self.editor)
         holder = QWidget()
@@ -110,12 +112,12 @@ class MainWindow(QMainWindow):
         hl.addWidget(self.canvas)
         mid.addWidget(holder, 1)
         self.queue = QueuePanel(self.batch_model, self.batch_ctl)
-        self.right_env = EnvelopePanel(self.queue, "right", RIGHT_W, T.BLUE, tooltip=tr("fold.right"))
+        self.right_env = EnvelopePanel(self.queue, "right", RIGHT_W, tooltip=tr("fold.right"))
         mid.addWidget(self.right_env)
         root.addLayout(mid, 1)
 
         self.statusbar = StatusBar()
-        self.status_env = EnvelopePanel(self.statusbar, "bottom", STATUS_H, T.GREEN, tooltip=tr("fold.status"))
+        self.status_env = EnvelopePanel(self.statusbar, "bottom", STATUS_H, tooltip=tr("fold.status"))
         root.addWidget(self.status_env)
         self.right_env.set_open(False, animate=False)
 
@@ -181,7 +183,7 @@ class MainWindow(QMainWindow):
         self.batch_ctl.finished.connect(self._batch_finished)
         self.model_ctl.failed.connect(lambda msg: dialogs.error(self, tr("ai.failed"), msg))
         self.model_ctl.changed.connect(self._model_changed)
-        self._last_model_state = self.model_ctl.state
+        self._last_model_states = {m: self.model_ctl.state(m) for m in MODELS}
         self._queue_counts()
 
     # ------------------------------------------------------------------ language / chrome
@@ -347,15 +349,14 @@ class MainWindow(QMainWindow):
         if self.batch_ctl.running:
             return
         if not self.batch_model.items:
-            dialogs.notify(self, tr("bt.title"), tr("bt.nofiles"), accent=T.BLUE, icon="batch")
+            dialogs.notify(self, tr("bt.title"), tr("bt.nofiles"), icon="batch")
             return
         e = self.editor
         region = e.batch_rect if e.batch_region_on else None
-        use_ai = e.erase.use_ai or e.erase.always_ai
         page = self.drawer.batch_page
         self.batch_ctl.settings.workers = int(page.workers.value()) if page.workers.isVisible() else 1
         page.set_start_key("bt.start")
-        if self.batch_ctl.start(e.erase.options(), region, use_ai=use_ai):
+        if self.batch_ctl.start(e.erase.options(), region):
             e.set_status("st.batch_running")
 
     def _queue_counts(self) -> None:
@@ -376,10 +377,11 @@ class MainWindow(QMainWindow):
         self.queue.refresh()
 
     def _model_changed(self) -> None:
-        st = self.model_ctl.state
-        if st == "ready" and self._last_model_state in ("downloading", "importing"):
-            self.editor.set_status("st.model_ready")
-        self._last_model_state = st
+        now = {m: self.model_ctl.state(m) for m in MODELS}
+        for m, st in now.items():
+            if st == "ready" and self._last_model_states.get(m) in ("downloading", "importing"):
+                self.editor.set_status("st.model_ready", name=MODELS[m].label)
+        self._last_model_states = now
 
     # ------------------------------------------------------------------ drag & drop
 
@@ -408,7 +410,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e: QCloseEvent) -> None:
         if self.batch_ctl.running:
-            if not dialogs.confirm(self, tr("bt.title"), tr("bt.quit_running"), "bt.stop", accent=T.RED, icon="stop"):
+            if not dialogs.confirm(self, tr("bt.title"), tr("bt.quit_running"), "bt.stop", accent=dialogs.ALERT, icon="stop"):
                 e.ignore()
                 return
             self.batch_ctl.stop()

@@ -1,52 +1,49 @@
-"""The left drawer: tool selector, the contextual tool panels, the AI-model card and the history row."""
+"""The left drawer: tool selector, the contextual tool panels, the fill-engine card and the history row."""
 from __future__ import annotations
 
 import os
-import sys
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QRectF, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter, QPen
-from PySide6.QtWidgets import (QFileDialog, QFontComboBox, QHBoxLayout, QLabel, QLineEdit, QScrollArea, QSizePolicy,
-                               QVBoxLayout, QWidget)
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter
+from PySide6.QtWidgets import (QFileDialog, QFontComboBox, QHBoxLayout, QLabel, QLineEdit, QScrollArea, QVBoxLayout,
+                               QWidget)
 
 from .. import settings as S
 from .. import theme as T
 from ..controllers import BatchController, ModelController
-from ..editor import BrushSettings, EditorModel, RepairTool, Tool
+from ..core.neural import MODELS
+from ..editor import ENGINES, BrushSettings, EditorModel, RepairTool, Tool
 from ..i18n import tr
 from . import dialogs
 from .pop import (Chip, HintLabel, PopButton, PopCheck, PopPanel, PopProgress, PopSegmented, PopSlider, SectionLabel,
-                  ToolButton, paper_brush)
+                  ToolButton)
 
-
-MODEL_MB = 208      # size of the default LaMa ONNX file, shown in the download confirmation
 
 # ====================================================================== base pieces
 
 class PaperPane(QWidget):
-    """Paper background with an ink rule on the side that faces the canvas."""
+    """White page with a black rule on the side that faces the canvas."""
 
-    def __init__(self, rule: str = "right", parent: Optional[QWidget] = None, seed: int = 2):
+    def __init__(self, rule: str = "right", parent: Optional[QWidget] = None, thick: float = T.RULE):
         super().__init__(parent)
         self.rule = rule
-        self.seed = seed
+        self.thick = int(thick)
 
     def paintEvent(self, e) -> None:
         p = QPainter(self)
-        p.fillRect(self.rect(), paper_brush(T.PAPER, self.seed))
-        pen = QPen(QColor(T.INK), 3.0)
-        p.setPen(pen)
-        w, h = self.width(), self.height()
+        p.fillRect(self.rect(), QColor(T.PAPER))
+        ink = QColor(T.INK)
+        w, h, t = self.width(), self.height(), self.thick
         if self.rule == "right":
-            p.drawLine(w - 2, 0, w - 2, h)
+            p.fillRect(w - t, 0, t, h, ink)
         elif self.rule == "left":
-            p.drawLine(1, 0, 1, h)
+            p.fillRect(0, 0, t, h, ink)
         elif self.rule == "bottom":
-            p.drawLine(0, h - 2, w, h - 2)
+            p.fillRect(0, h - t, w, t, ink)
         elif self.rule == "top":
-            p.drawLine(0, 1, w, 1)
+            p.fillRect(0, 0, w, t, ink)
 
 
 def _transparent_scroll(scroll: QScrollArea) -> None:
@@ -67,10 +64,10 @@ def _row(*widgets: QWidget, spacing: int = 10) -> QHBoxLayout:
     return r
 
 
-# ====================================================================== detection options + AI model
+# ====================================================================== detection options + fill engine
 
 class DetectOptions(QWidget):
-    """Sensitivity and stroke-grow sliders shared by the single-image eraser and the batch tool."""
+    """Sensitivity, stroke-grow and thorough-mode controls shared by the single-image eraser and the batch tool."""
 
     def __init__(self, editor: EditorModel, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -78,12 +75,17 @@ class DetectOptions(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(4)
-        self.sens = PopSlider("er.sens", 0.0, 1.0, editor.erase.sensitivity, step=0.01, color=T.RED)
-        self.grow = PopSlider("er.grow", 0.0, 0.4, editor.erase.grow, step=0.01, color=T.RED)
+        self.sens = PopSlider("er.sens", 0.0, 1.0, editor.erase.sensitivity, step=0.01)
+        self.grow = PopSlider("er.grow", 0.0, 0.4, editor.erase.grow, step=0.01)
+        self.thorough = PopCheck("er.thorough", editor.erase.thorough)
         lay.addWidget(self.sens)
         lay.addWidget(self.grow)
+        lay.addSpacing(4)
+        lay.addWidget(self.thorough)
+        lay.addWidget(HintLabel("er.thorough.hint", px=11))
         self.sens.valueChanged.connect(self._sens)
         self.grow.valueChanged.connect(self._grow)
+        self.thorough.toggledBool.connect(self._thorough)
         editor.prefsChanged.connect(self.refresh)
 
     def _sens(self, v: float) -> None:
@@ -96,54 +98,117 @@ class DetectOptions(QWidget):
         S.put("erase/grow", v)
         self.editor.prefsChanged.emit()
 
+    def _thorough(self, on: bool) -> None:
+        self.editor.erase.thorough = on
+        S.put("erase/thorough", on)
+        self.editor.prefsChanged.emit()
+
     def refresh(self) -> None:
         self.sens.setValue(self.editor.erase.sensitivity)
         self.grow.setValue(self.editor.erase.grow)
+        self.thorough.blockSignals(True)
+        self.thorough.setChecked(self.editor.erase.thorough)
+        self.thorough.blockSignals(False)
 
 
-class AiModelPanel(PopPanel):
-    """Optional neural inpainting model: download (after a confirmation), import, remove, use."""
+class ModelRow(QWidget):
+    """One downloadable fill model: name and size, a status chip and the DOWNLOAD / CANCEL / REMOVE buttons."""
 
-    def __init__(self, editor: EditorModel, models: ModelController, parent: Optional[QWidget] = None):
-        super().__init__("ai.title", T.BLUE, parent)
-        self.editor, self.models = editor, models
+    def __init__(self, model: str, models: ModelController, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.model, self.models = model, models
+        self.spec = MODELS[model]
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
         top = QHBoxLayout()
         top.setSpacing(8)
-        self.chip = Chip("", T.PAPER_HI)
+        self.name = QLabel(f"{self.spec.label.upper()}  ·  {self.spec.size_mb} MB")
+        self.name.setFont(T.font_label(11, True, 1.0))
+        self.chip = Chip("", "paper")
+        top.addWidget(self.name, 1)
         top.addWidget(self.chip)
-        top.addStretch(1)
-        self.body.addLayout(top)
-        self.hint = HintLabel("ai.hint")
-        self.body.addWidget(self.hint)
-        self.bar = PopProgress(T.BLUE)
-        self.body.addWidget(self.bar)
-        self.btn_dl = PopButton("ai.download", "blue", "download", height=36, px=11)
-        self.btn_cancel = PopButton("ai.cancel", "paper", "close", height=36, px=11)
-        self.btn_imp = PopButton("ai.import", "paper", "folder", height=36, px=11)
-        self.btn_rm = PopButton("ai.remove", "paper", "trash", height=36, px=11)
-        self.body.addLayout(_row(self.btn_dl, self.btn_cancel))
-        self.body.addLayout(_row(self.btn_imp, self.btn_rm))
-        self.use = PopCheck("ai.use", editor.erase.use_ai, accent=T.BLUE)
-        self.always = PopCheck("ai.always", editor.erase.always_ai, accent=T.BLUE)
-        self.body.addWidget(self.use)
-        self.body.addWidget(self.always)
-
+        lay.addLayout(top)
+        self.bar = PopProgress()
+        lay.addWidget(self.bar)
+        self.btn_dl = PopButton("ai.download", "paper", "download", height=34, px=10.5)
+        self.btn_cancel = PopButton("ai.cancel", "paper", "close", height=34, px=10.5)
+        self.btn_rm = PopButton("ai.remove", "paper", "trash", height=34, px=10.5)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for b in (self.btn_dl, self.btn_cancel, self.btn_rm):
+            row.addWidget(b, 1)
+        lay.addLayout(row)
         self.btn_dl.clicked.connect(self._download)
         self.btn_cancel.clicked.connect(models.cancel)
-        self.btn_imp.clicked.connect(self._import)
         self.btn_rm.clicked.connect(self._remove)
-        self.use.toggledBool.connect(self._use)
-        self.always.toggledBool.connect(self._always)
+
+    # --- actions ---------------------------------------------------------------------------------
+    def _download(self) -> None:
+        host = self.spec.urls[0].split("/")[2] if self.spec.urls else ""
+        title = tr("ai.confirm.title", name=self.spec.label.upper())
+        body = tr("ai.confirm.body", name=self.spec.label, mb=self.spec.size_mb, host=host)
+        if dialogs.confirm(self.window(), title, body, "ai.confirm.ok", icon="download"):
+            self.models.download(self.model)
+
+    def _remove(self) -> None:
+        title = tr("ai.remove.title", name=self.spec.label.upper())
+        if dialogs.confirm(self.window(), title, tr("ai.remove.body", name=self.spec.label), "ai.remove",
+                           accent=dialogs.ALERT, icon="trash"):
+            self.models.remove(self.model)
+
+    # --- state -----------------------------------------------------------------------------------
+    def refresh(self) -> None:
+        st = self.models.state(self.model)
+        busy_elsewhere = bool(self.models.busy) and st not in ("downloading",)
+        if st == "ready":
+            self.chip.set_chip(tr("ai.state.ready", mb=int(round(self.models.size_mb(self.model)))), "ink")
+        elif st == "downloading":
+            self.chip.set_chip(tr("ai.state.downloading", pct=int(round(self.models.progress * 100))), "red")
+        elif st == "importing":
+            self.chip.set_chip(tr("ai.state.importing"), "red")
+        else:
+            self.chip.set_chip(tr("ai.state.missing"), "paper")
+        self.bar.setVisible(st == "downloading")
+        if st == "downloading":
+            self.bar.set_progress(self.models.progress, self.models.host)
+        self.btn_dl.setVisible(st == "missing")
+        self.btn_dl.setEnabled(not busy_elsewhere)
+        self.btn_cancel.setVisible(st == "downloading")
+        self.btn_rm.setVisible(st == "ready")
+        self.btn_rm.setEnabled(not busy_elsewhere)
+
+
+class EnginePanel(PopPanel):
+    """How the gaps left by the erased text are filled: one choice, plus the optional models to download or import."""
+
+    _ready = False              # PopPanel.__init__ retranslates before our widgets exist
+
+    def __init__(self, editor: EditorModel, models: ModelController, parent: Optional[QWidget] = None):
+        super().__init__("eng.title", parent)
+        self.editor, self.models = editor, models
+        self.seg = PopSegmented([(e, f"eng.{e}") for e in ENGINES], editor.erase.engine if editor.erase.engine in ENGINES else "auto")
+        self.body.addWidget(self.seg)
+        self.hint = HintLabel("", provider=self._hint_text)
+        self.body.addWidget(self.hint)
+        self.rows = {m: ModelRow(m, models) for m in ("migan", "lama")}
+        for row in self.rows.values():
+            self.body.addWidget(row)
+        self.btn_imp = PopButton("ai.import", "paper", "folder", height=34, px=10.5)
+        self.body.addWidget(self.btn_imp)
+
+        self.seg.currentChanged.connect(self._engine)
+        self.btn_imp.clicked.connect(self._import)
         models.changed.connect(self.refresh)
         editor.prefsChanged.connect(self.refresh)
         self._ready = True
         self.refresh()
 
     # --- actions ---------------------------------------------------------------------------------
-    def _download(self) -> None:
-        body = tr("ai.confirm.body", mb=MODEL_MB, host="huggingface.co")
-        if dialogs.confirm(self.window(), tr("ai.confirm.title"), body, "ai.confirm.ok", accent=T.BLUE, icon="download"):
-            self.models.download()
+    def _engine(self, ident: str) -> None:
+        self.editor.erase.engine = ident
+        S.put("erase/engine", ident)
+        self.editor.prefsChanged.emit()
 
     def _import(self) -> None:
         start = S.get_str("ai/import_dir", "")
@@ -152,71 +217,39 @@ class AiModelPanel(PopPanel):
             S.put("ai/import_dir", str(Path(path).parent))
             self.models.import_file(path)
 
-    def _remove(self) -> None:
-        if dialogs.confirm(self.window(), tr("ai.remove.title"), tr("ai.remove.body"), "ai.remove", accent=T.RED, icon="trash"):
-            self.models.remove()
-            self.editor.erase.always_ai = False
-            self.editor.prefsChanged.emit()
-
-    def _use(self, on: bool) -> None:
-        self.editor.erase.use_ai = on
-        if not on:
-            self.editor.erase.always_ai = False
-        S.put("erase/use_ai", on)
-        S.put("erase/always_ai", self.editor.erase.always_ai)
-        self.editor.prefsChanged.emit()
-
-    def _always(self, on: bool) -> None:
-        self.editor.erase.always_ai = on
-        if on:
-            self.editor.erase.use_ai = True
-        S.put("erase/use_ai", self.editor.erase.use_ai)
-        S.put("erase/always_ai", on)
-        self.editor.prefsChanged.emit()
-
     # --- state -----------------------------------------------------------------------------------
+    def _hint_text(self) -> str:
+        eng = self.editor.erase.engine if hasattr(self, "editor") else "auto"
+        text = tr(f"eng.hint.{eng}")
+        if eng in MODELS and hasattr(self, "models") and self.models.state(eng) == "missing":
+            text += "  " + tr("eng.missing")
+        return text
+
     def refresh(self) -> None:
-        st = self.models.state
-        ready = st == "ready"
-        busy = st in ("downloading", "importing")
-        if st == "ready":
-            self.chip.set_chip(tr("ai.state.ready", mb=int(round(self.models.size_mb()))), T.GREEN)
-        elif st == "downloading":
-            pct = int(round(self.models.progress * 100))
-            self.chip.set_chip(tr("ai.state.downloading", pct=pct), T.YELLOW)
-        elif st == "importing":
-            self.chip.set_chip(tr("ai.state.importing"), T.YELLOW)
-        else:
-            self.chip.set_chip(tr("ai.state.missing"), T.PAPER_HI)
-        self.bar.setVisible(st == "downloading")
-        if st == "downloading":
-            self.bar.set_progress(self.models.progress, self.models.host)
-        self.btn_dl.setVisible(not ready and not busy)
-        self.btn_cancel.setVisible(st == "downloading")
-        self.btn_imp.setVisible(not ready and not busy)
-        self.btn_rm.setVisible(ready)
-        for cb, val, enabled in ((self.use, self.editor.erase.use_ai, ready),
-                                 (self.always, self.editor.erase.always_ai, ready and self.editor.erase.use_ai)):
-            cb.blockSignals(True)
-            cb.setChecked(bool(val and enabled))
-            cb.blockSignals(False)
-            cb.setEnabled(enabled)
+        if not self._ready:
+            return
+        eng = self.editor.erase.engine
+        if eng in ENGINES:
+            self.seg.setCurrent(eng)
+        self.hint.retranslate()
+        for row in self.rows.values():
+            row.refresh()
+        self.btn_imp.setEnabled(not self.models.busy)
 
     def retranslate(self) -> None:
         super().retranslate()
-        if getattr(self, "_ready", False):            # PopPanel.__init__ calls this before our attributes exist
-            self.refresh()
+        self.refresh()
 
 
 # ====================================================================== tool pages
 
 class CropPage(PopPanel):
     def __init__(self, editor: EditorModel, parent: Optional[QWidget] = None):
-        super().__init__("tool.crop", T.YELLOW, parent)
+        super().__init__("tool.crop", parent)
         self.editor = editor
         self.body.addWidget(HintLabel("crop.hint"))
         full = PopButton("crop.full", "paper", "fit", height=38, px=11)
-        apply_ = PopButton("crop.apply", "yellow", "check", height=38, px=11)
+        apply_ = PopButton("crop.apply", "red", "check", height=38, px=11)
         self.body.addLayout(_row(full, apply_))
         full.clicked.connect(self._full)
         apply_.clicked.connect(editor.confirm_crop)
@@ -228,20 +261,20 @@ class CropPage(PopPanel):
 
 class RepairPage(PopPanel):
     def __init__(self, editor: EditorModel, parent: Optional[QWidget] = None):
-        super().__init__("tool.repair", T.GREEN, parent)
+        super().__init__("tool.repair", parent)
         self.editor = editor
         b = editor.brush
         self.seg = PopSegmented([(RepairTool.HEAL.value, "rep.tool.heal"), (RepairTool.SMUDGE.value, "rep.tool.smudge"),
-                                 (RepairTool.TEXTURE.value, "rep.tool.texture")], b.tool.value, T.GREEN)
+                                 (RepairTool.TEXTURE.value, "rep.tool.texture")], b.tool.value)
         self.body.addWidget(self.seg)
         self.hint = HintLabel("rep.hint.heal")
         self.body.addWidget(self.hint)
-        self.size_sl = PopSlider("rep.size", 4, 120, b.size, step=1, decimals=0, color=T.GREEN)
-        self.hard = PopSlider("rep.hardness", 0.0, 1.0, b.hardness, step=0.01, color=T.GREEN)
-        self.flow = PopSlider("rep.flow", 0.05, 1.0, b.flow, step=0.01, color=T.GREEN)
-        self.strength = PopSlider("rep.strength", 0.0, 1.0, b.strength, step=0.01, color=T.GREEN)
-        self.smear = PopSlider("rep.smear", 0.1, 1.0, b.smear, step=0.01, color=T.GREEN)
-        self.block = PopSlider("rep.block", 2, 40, b.block, step=1, decimals=0, color=T.GREEN)
+        self.size_sl = PopSlider("rep.size", 4, 120, b.size, step=1, decimals=0)
+        self.hard = PopSlider("rep.hardness", 0.0, 1.0, b.hardness, step=0.01)
+        self.flow = PopSlider("rep.flow", 0.05, 1.0, b.flow, step=0.01)
+        self.strength = PopSlider("rep.strength", 0.0, 1.0, b.strength, step=0.01)
+        self.smear = PopSlider("rep.smear", 0.1, 1.0, b.smear, step=0.01)
+        self.block = PopSlider("rep.block", 2, 40, b.block, step=1, decimals=0)
         for w in (self.size_sl, self.hard, self.flow, self.strength, self.smear, self.block):
             self.body.addWidget(w)
         self.seg.currentChanged.connect(self._tool)
@@ -274,7 +307,7 @@ class RepairPage(PopPanel):
 
 class WatermarkPage(PopPanel):
     def __init__(self, editor: EditorModel, parent: Optional[QWidget] = None):
-        super().__init__("tool.watermark", T.PINK, parent)
+        super().__init__("tool.watermark", parent)
         self.editor = editor
         wm = editor.wm
         self.body.addWidget(SectionLabel("wm.text"))
@@ -290,14 +323,14 @@ class WatermarkPage(PopPanel):
         self.font_box.setCurrentFont(QFont(wm.font))
         self.body.addWidget(self.font_box)
         self.body.addWidget(SectionLabel("wm.color"))
-        self.color = PopSegmented([("white", "wm.white"), ("black", "wm.black")], wm.color, T.PINK)
+        self.color = PopSegmented([("white", "wm.white"), ("black", "wm.black")], wm.color)
         self.body.addWidget(self.color)
-        self.size_sl = PopSlider("wm.size", 0.3, 3.0, wm.size, step=0.05, color=T.PINK)
-        self.opacity = PopSlider("wm.opacity", 0.05, 1.0, wm.opacity, step=0.01, color=T.PINK)
+        self.size_sl = PopSlider("wm.size", 0.3, 3.0, wm.size, step=0.05)
+        self.opacity = PopSlider("wm.opacity", 0.05, 1.0, wm.opacity, step=0.01)
         self.body.addWidget(self.size_sl)
         self.body.addWidget(self.opacity)
         self.body.addWidget(HintLabel("wm.hint"))
-        self.apply = PopButton("wm.apply", "pink", "check", height=38, px=11)
+        self.apply = PopButton("wm.apply", "red", "check", height=38, px=11)
         self.body.addWidget(self.apply)
         self.edit.textChanged.connect(self._text)
         self.font_box.currentFontChanged.connect(self._font)
@@ -328,7 +361,7 @@ class WatermarkPage(PopPanel):
 
 
 class ErasePage(QWidget):
-    """ERASE TEXT card + the AI model card below it."""
+    """ERASE TEXT card + the fill-engine card below it."""
 
     def __init__(self, editor: EditorModel, models: ModelController, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -336,9 +369,9 @@ class ErasePage(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(12)
-        card = PopPanel("tool.erase", T.RED)
+        card = PopPanel("tool.erase")
         self.scope = PopSegmented([("region", "er.region"), ("whole", "er.whole")],
-                                  "whole" if editor.erase.whole_image else "region", T.RED)
+                                  "whole" if editor.erase.whole_image else "region")
         card.body.addWidget(self.scope)
         self.hint = HintLabel("er.hint.region")
         card.body.addWidget(self.hint)
@@ -348,7 +381,7 @@ class ErasePage(QWidget):
         self.btn_run = PopButton("er.run", "red", "erase", height=38, px=11)
         card.body.addLayout(_row(self.btn_detect, self.btn_run))
         lay.addWidget(card)
-        lay.addWidget(AiModelPanel(editor, models))
+        lay.addWidget(EnginePanel(editor, models))
         self.scope.currentChanged.connect(self._scope)
         self.btn_detect.clicked.connect(editor.detect_text)
         self.btn_run.clicked.connect(editor.erase_text)
@@ -368,7 +401,7 @@ class ErasePage(QWidget):
 
 
 class BatchPage(QWidget):
-    """Batch settings card, run controls and the AI model card."""
+    """Batch run card, output card, detection card and the fill-engine card."""
     addFilesRequested = Signal()
     addFolderRequested = Signal()
 
@@ -382,17 +415,17 @@ class BatchPage(QWidget):
         lay.setSpacing(12)
 
         # --- run card -------------------------------------------------------------------------
-        run = PopPanel("tool.batch", T.BLUE)
+        run = PopPanel("tool.batch")
         run.body.addWidget(HintLabel("bt.hint"))
         add = PopButton("bt.add", "paper", "plus", height=36, px=11)
         folder = PopButton("bt.folder", "paper", "folder", height=36, px=11)
         run.body.addLayout(_row(add, folder))
         add.clicked.connect(self.addFilesRequested)
         folder.clicked.connect(self.addFolderRequested)
-        self.btn_start = PopButton("bt.start", "blue", "play", height=42, px=12)
-        self.btn_stop = PopButton("bt.stop", "red", "stop", height=42, px=12)
+        self.btn_start = PopButton("bt.start", "red", "play", height=42, px=12)
+        self.btn_stop = PopButton("bt.stop", "ink", "stop", height=42, px=12)
         run.body.addLayout(_row(self.btn_start, self.btn_stop))
-        self.bar = PopProgress(T.BLUE)
+        self.bar = PopProgress()
         run.body.addWidget(self.bar)
         self.summary = HintLabel("", text="")
         run.body.addWidget(self.summary)
@@ -401,7 +434,7 @@ class BatchPage(QWidget):
         lay.addWidget(run)
 
         # --- output card ----------------------------------------------------------------------
-        out = PopPanel("bt.out", T.YELLOW)
+        out = PopPanel("bt.out")
         out.body.addWidget(SectionLabel("bt.out.dir"))
         self.dir_edit = QLineEdit(S.get_str("batch/out_dir", ""))
         self.dir_edit.setPlaceholderText(tr("bt.out.same"))
@@ -414,34 +447,33 @@ class BatchPage(QWidget):
         out.body.addWidget(self.suffix)
         out.body.addWidget(SectionLabel("bt.format"))
         self.fmt = PopSegmented([("same", "bt.fmt.same"), ("png", "bt.fmt.png"), ("jpg", "bt.fmt.jpg"), ("webp", "bt.fmt.webp")],
-                                s.fmt, T.YELLOW)
+                                s.fmt)
         out.body.addWidget(self.fmt)
-        self.quality = PopSlider("bt.quality", 50, 100, s.quality, step=1, decimals=0, color=T.YELLOW)
+        self.quality = PopSlider("bt.quality", 50, 100, s.quality, step=1, decimals=0)
         out.body.addWidget(self.quality)
         out.body.addWidget(SectionLabel("bt.exists"))
         self.exists = PopSegmented([("rename", "bt.ex.rename"), ("skip", "bt.ex.skip"), ("overwrite", "bt.ex.overwrite")],
-                                   s.existing, T.YELLOW)
+                                   s.existing)
         out.body.addWidget(self.exists)
-        self.keep = PopCheck("bt.keep", s.keep_structure, accent=T.YELLOW)
-        self.unchanged = PopCheck("bt.unchanged", s.save_unchanged, accent=T.YELLOW)
+        self.keep = PopCheck("bt.keep", s.keep_structure)
+        self.unchanged = PopCheck("bt.unchanged", s.save_unchanged)
         out.body.addWidget(self.keep)
         out.body.addWidget(self.unchanged)
         lay.addWidget(out)
 
         # --- detection card -------------------------------------------------------------------
-        det = PopPanel("bt.detect", T.RED)
-        self.region = PopCheck("bt.region", editor.batch_region_on, accent=T.RED)
+        det = PopPanel("bt.detect")
+        self.region = PopCheck("bt.region", editor.batch_region_on)
         det.body.addWidget(self.region)
         self.region_hint = HintLabel("bt.region.hint")
         det.body.addWidget(self.region_hint)
         det.body.addWidget(DetectOptions(editor))
         max_workers = max(1, min(4, (os.cpu_count() or 2) // 2))
-        self.workers = PopSlider("bt.workers", 1, max(2, max_workers), min(s.workers, max_workers), step=1, decimals=0,
-                                 color=T.RED)
+        self.workers = PopSlider("bt.workers", 1, max(2, max_workers), min(s.workers, max_workers), step=1, decimals=0)
         self.workers.setVisible(max_workers > 1)
         det.body.addWidget(self.workers)
         lay.addWidget(det)
-        lay.addWidget(AiModelPanel(editor, models))
+        lay.addWidget(EnginePanel(editor, models))
 
         # --- wiring ---------------------------------------------------------------------------
         browse.clicked.connect(self._browse)
@@ -527,9 +559,9 @@ class HistoryRow(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
-        self.undo = PopButton("hist.undo", "paper", "undo", height=36, px=10.5, shadow=3)
-        self.redo = PopButton("hist.redo", "paper", "redo", height=36, px=10.5, shadow=3)
-        self.reset = PopButton("hist.reset", "paper", "reset", height=36, px=10.5, shadow=3)
+        self.undo = PopButton("hist.undo", "paper", "undo", height=36, px=10.5)
+        self.redo = PopButton("hist.redo", "paper", "redo", height=36, px=10.5)
+        self.reset = PopButton("hist.reset", "paper", "reset", height=36, px=10.5)
         for b in (self.undo, self.redo, self.reset):
             lay.addWidget(b, 1)
         self.undo.clicked.connect(editor.undo)
@@ -562,7 +594,7 @@ class ToolDrawer(PaperPane):
         for tool, key, icon in ((Tool.CROP, "tool.crop", "crop"), (Tool.REPAIR, "tool.repair", "repair"),
                                 (Tool.WATERMARK, "tool.watermark", "watermark"), (Tool.ERASE, "tool.erase", "erase"),
                                 (Tool.BATCH, "tool.batch", "batch")):
-            b = ToolButton(key, T.TOOL_COLORS[tool.value], icon)
+            b = ToolButton(key, icon)
             b.clicked.connect(lambda _=False, t=tool: self._clicked(t))
             self.buttons[tool] = b
             lay.addWidget(b)
